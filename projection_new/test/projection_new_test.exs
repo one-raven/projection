@@ -34,7 +34,7 @@ defmodule ProjectionNewTest do
     assert ui_host_main =~ "projection_ui_host_runtime::app_main!"
 
     ui_host_cargo = File.read!(Path.join(target, "slint/ui_host/Cargo.toml"))
-    assert ui_host_cargo =~ "runtime_support/projection_ui_host_runtime"
+    assert ui_host_cargo =~ "../../deps/projection/slint/ui_host_runtime"
 
     app_shell = File.read!(Path.join(target, "lib/starter_app/ui/app_shell.slint"))
     assert app_shell =~ "in property <length> window_width"

@@ -63,6 +63,7 @@ The host bridges those loops through framed stdio messages.
 - Each route resolves to a screen module using `use ProjectionUI, :screen`.
 - Screen `schema do ... end` defines typed VM fields used by codegen.
 - `:list` fields default to string lists; use `items: :integer | :float | :bool | :string` for typed lists.
+- `:id_table` fields require typed columns, for example `columns: [name: :string, pos: :integer]`.
 - Generated bindings connect patch paths to concrete Slint property setters.
 
 ## Install
@@ -84,7 +85,10 @@ It generates a ready-to-run Projection + Slint starter app (router, hello screen
 UI templates, and a thin `ui_host` adapter crate).
 
 The generated app does not copy large host runtime files into your project.
-`mix compile.projection_ui_host` syncs the runtime support crate from your Projection dependency.
+The generated app references the shared Rust runtime crate directly from
+`deps/projection/slint/ui_host_runtime`.
+
+Requirement: use Projection from the default Mix deps location (`deps/projection`).
 
 Build and install the archive locally:
 
@@ -194,7 +198,7 @@ Notes:
 - Keep Slint files in `lib/<otp_app>/ui/`.
 - Keep reusable Slint visuals in `lib/<otp_app>/ui/components/`.
 - Define app window defaults in `app_shell.slint` via `window_width` / `window_height`.
-- `slint/ui_host/src/main.rs` should stay thin. Shared runtime logic lives in Projection's `slint/ui_host_runtime` crate and is synced automatically by `mix compile.projection_ui_host`.
+- `slint/ui_host/src/main.rs` should stay thin. Shared runtime logic lives in Projection's `slint/ui_host_runtime` crate and is referenced from `../../deps/projection/slint/ui_host_runtime`.
 
 ## Screen and Slint naming convention
 

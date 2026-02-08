@@ -14,7 +14,6 @@ defmodule Mix.Tasks.Compile.ProjectionUiHost do
     manifest = Path.expand("slint/ui_host/Cargo.toml")
 
     if File.regular?(manifest) do
-      sync_runtime_support!(manifest)
       build_ui_host!(manifest)
       copy_ui_host_binary!()
     end
@@ -36,46 +35,6 @@ defmodule Mix.Tasks.Compile.ProjectionUiHost do
 
     if status != 0 do
       Mix.raise("failed to build ui_host (exit #{status})\n#{output}")
-    end
-  end
-
-  defp sync_runtime_support!(manifest) do
-    with {:ok, cargo_toml} <- File.read(manifest),
-         true <- String.contains?(cargo_toml, "runtime_support/projection_ui_host_runtime") do
-      source = runtime_source_dir!()
-
-      target =
-        Path.expand(
-          Path.join(["slint", "ui_host", "runtime_support", "projection_ui_host_runtime"])
-        )
-
-      File.rm_rf!(target)
-      File.mkdir_p!(Path.dirname(target))
-      File.cp_r!(source, target)
-    else
-      _ -> :ok
-    end
-  end
-
-  defp runtime_source_dir! do
-    case Mix.Project.deps_paths() do
-      %{projection: dep_path} ->
-        source = Path.join(dep_path, "slint/ui_host_runtime")
-
-        if File.regular?(Path.join(source, "Cargo.toml")) do
-          source
-        else
-          Mix.raise("projection_ui_host_runtime crate not found at #{source}")
-        end
-
-      _ ->
-        source = Path.expand(Path.join(["slint", "ui_host_runtime"]))
-
-        if File.regular?(Path.join(source, "Cargo.toml")) do
-          source
-        else
-          Mix.raise("projection_ui_host_runtime crate not found at #{source}")
-        end
     end
   end
 

@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-projection_ui_host_runtime = { path = "runtime_support/projection_ui_host_runtime" }
+projection_ui_host_runtime = { path = "../../deps/projection/slint/ui_host_runtime" }
 serde_json = "1.0.149"
 slint = { version = "=1.15.0", default-features = false, features = ["std", "backend-winit", "renderer-software", "compat-1-2"] }
 
