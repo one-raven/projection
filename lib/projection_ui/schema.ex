@@ -14,7 +14,7 @@ defmodule ProjectionUI.Schema do
     * `:float` — default `0.0`
     * `:map` — default `%{}`
     * `:list` — default `[]` (`items: :string | :integer | :float | :bool`, default `:string`)
-    * `:id_table` — default `%{order: [], by_id: %{}}`
+    * `:id_table` — default `%{order: [], by_id: %{}}` (`columns: [name: :string, ...]`)
 
   Component fields are declared with `component/2,3` (not `field/3`):
 
@@ -39,6 +39,7 @@ defmodule ProjectionUI.Schema do
   @allowed_types [:string, :bool, :integer, :float, :map, :list, :id_table]
   @component_supported_types [:string, :bool, :integer, :float, :list, :id_table]
   @list_item_types [:string, :integer, :float, :bool]
+  @id_table_column_types [:string, :integer, :float, :bool]
 
   defmacro __using__(opts) do
     owner = Keyword.get(opts, :owner)
@@ -97,9 +98,12 @@ defmodule ProjectionUI.Schema do
         :error -> default_for_type(expanded_type)
       end
 
-    validate_default!(expanded_name, expanded_type, default, expanded_opts, caller)
+    normalized_opts =
+      expanded_type
+      |> normalize_field_opts(expanded_opts)
+      |> Keyword.put(:default, default)
 
-    normalized_opts = Keyword.put(expanded_opts, :default, default)
+    validate_default!(expanded_name, expanded_type, default, normalized_opts, caller)
 
     quote do
       @projection_schema_fields {unquote(expanded_name), unquote(expanded_type),
@@ -303,24 +307,30 @@ defmodule ProjectionUI.Schema do
   end
 
   defp validate_opts!(:id_table, opts, caller) when is_list(opts) do
-    case Keyword.get(opts, :columns) do
-      columns when is_list(columns) ->
-        if columns != [] and Enum.all?(columns, &is_atom/1) do
-          :ok
-        else
-          raise CompileError,
-            file: caller.file,
-            line: caller.line,
-            description:
-              ":id_table fields require `columns: [...]` with one or more atom column names"
-        end
+    unknown_keys =
+      opts
+      |> Keyword.keys()
+      |> Enum.uniq()
+      |> Enum.reject(&(&1 in [:default, :columns]))
 
-      _ ->
+    if unknown_keys != [] do
+      raise CompileError,
+        file: caller.file,
+        line: caller.line,
+        description:
+          "unsupported id_table field options: #{inspect(unknown_keys)} (supported: [:default, :columns])"
+    end
+
+    case Keyword.fetch(opts, :columns) do
+      {:ok, columns} ->
+        validate_id_table_columns!(columns, caller)
+
+      :error ->
         raise CompileError,
           file: caller.file,
           line: caller.line,
           description:
-            ":id_table fields require `columns: [...]` with one or more atom column names"
+            ":id_table fields require typed columns, for example `columns: [name: :string, status: :string]`"
     end
   end
 
@@ -386,6 +396,17 @@ defmodule ProjectionUI.Schema do
   defp value_matches_type?(:id_table, value, opts), do: valid_id_table?(value, opts)
   defp value_matches_type?(:component, value, opts), do: valid_component_value?(value, opts)
 
+  defp normalize_field_opts(:id_table, opts) when is_list(opts) do
+    columns =
+      opts
+      |> Keyword.get(:columns, [])
+      |> normalize_id_table_columns()
+
+    Keyword.put(opts, :columns, columns)
+  end
+
+  defp normalize_field_opts(_type, opts), do: opts
+
   defp default_for_type(:string), do: ""
   defp default_for_type(:bool), do: false
   defp default_for_type(:integer), do: 0
@@ -403,45 +424,100 @@ defmodule ProjectionUI.Schema do
 
   defp valid_id_table?(%{order: order, by_id: by_id}, opts)
        when is_list(order) and is_map(by_id) and is_list(opts) do
-    columns =
-      opts
-      |> Keyword.get(:columns, [])
-      |> Enum.map(&Atom.to_string/1)
+    columns = id_table_columns(opts)
 
     columns != [] and
       Enum.all?(order, &is_binary/1) and
       Enum.all?(order, fn id ->
         row = Map.get(by_id, id)
-        is_map(row) and Enum.all?(columns, &binary_cell?(row, &1))
+        is_map(row) and Enum.all?(columns, &id_table_cell_matches?(row, &1))
       end)
   end
 
   defp valid_id_table?(_value, _opts), do: false
 
-  defp binary_cell?(row, column) when is_map(row) and is_binary(column) do
-    case Map.fetch(row, column) do
-      {:ok, value} when is_binary(value) ->
-        true
+  defp validate_id_table_columns!(columns, caller) when is_list(columns) do
+    unless columns != [] and Keyword.keyword?(columns) do
+      raise CompileError,
+        file: caller.file,
+        line: caller.line,
+        description:
+          ":id_table fields require typed columns, for example `columns: [name: :string, status: :string]`"
+    end
 
-      _ ->
-        case maybe_existing_atom(column) do
-          {:ok, atom_column} ->
-            case Map.fetch(row, atom_column) do
-              {:ok, value} when is_binary(value) -> true
-              _ -> false
-            end
+    duplicate_columns =
+      columns
+      |> Keyword.keys()
+      |> Enum.group_by(& &1)
+      |> Enum.filter(fn {_name, entries} -> length(entries) > 1 end)
+      |> Enum.map(&elem(&1, 0))
 
-          :error ->
-            false
-        end
+    if duplicate_columns != [] do
+      raise CompileError,
+        file: caller.file,
+        line: caller.line,
+        description: "duplicate id_table columns: #{inspect(Enum.sort(duplicate_columns))}"
+    end
+
+    Enum.each(columns, fn {column_name, column_type} ->
+      unless column_type in @id_table_column_types do
+        raise CompileError,
+          file: caller.file,
+          line: caller.line,
+          description:
+            ":id_table columns must use one of #{inspect(@id_table_column_types)}, got #{inspect(column_name)}: #{inspect(column_type)}"
+      end
+    end)
+  end
+
+  defp validate_id_table_columns!(_columns, caller) do
+    raise CompileError,
+      file: caller.file,
+      line: caller.line,
+      description:
+        ":id_table fields require typed columns, for example `columns: [name: :string, status: :string]`"
+  end
+
+  defp normalize_id_table_columns(columns) when is_list(columns) do
+    Enum.map(columns, fn {name, type} -> %{name: name, type: type} end)
+  end
+
+  defp id_table_columns(opts) when is_list(opts) do
+    opts
+    |> Keyword.get(:columns, [])
+    |> Enum.reduce_while([], fn
+      %{name: name, type: type}, acc when is_atom(name) and type in @id_table_column_types ->
+        {:cont, [%{name: name, type: type} | acc]}
+
+      {name, type}, acc when is_atom(name) and type in @id_table_column_types ->
+        {:cont, [%{name: name, type: type} | acc]}
+
+      _other, _acc ->
+        {:halt, :invalid}
+    end)
+    |> case do
+      :invalid -> []
+      columns -> Enum.reverse(columns)
     end
   end
 
-  defp maybe_existing_atom(token) when is_binary(token) do
-    try do
-      {:ok, String.to_existing_atom(token)}
-    rescue
-      ArgumentError -> :error
+  defp id_table_columns(_opts), do: []
+
+  defp id_table_cell_matches?(row, %{name: column_name, type: column_type})
+       when is_map(row) and is_atom(column_name) and column_type in @id_table_column_types do
+    case fetch_id_table_cell(row, column_name) do
+      {:ok, value} -> list_item_matches?(column_type, value)
+      :error -> false
+    end
+  end
+
+  defp fetch_id_table_cell(row, column_name) when is_map(row) and is_atom(column_name) do
+    case Map.fetch(row, column_name) do
+      {:ok, value} ->
+        {:ok, value}
+
+      :error ->
+        Map.fetch(row, Atom.to_string(column_name))
     end
   end
 

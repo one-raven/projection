@@ -71,6 +71,26 @@ defmodule Projection.SchemaTest do
     def render(assigns), do: assigns
   end
 
+  defmodule TypedIdTableScreen do
+    use ProjectionUI, :screen
+
+    schema do
+      field(:devices, :id_table,
+        columns: [name: :string, status: :string, pos: :integer, load: :float, online: :bool],
+        default: %{
+          order: ["dev-1", "dev-2"],
+          by_id: %{
+            "dev-1" => %{name: "Kitchen", status: "Online", pos: 1, load: 0.5, online: true},
+            "dev-2" => %{name: "Door", status: "Offline", pos: 2, load: 0.0, online: false}
+          }
+        }
+      )
+    end
+
+    @impl true
+    def render(assigns), do: assigns
+  end
+
   defmodule StatusBadgeComponent do
     use ProjectionUI, :component
 
@@ -158,6 +178,79 @@ defmodule Projection.SchemaTest do
            ]
 
     assert :ok == Schema.validate_render!(TypedListScreen)
+  end
+
+  test "schema supports typed id_table columns and normalized metadata" do
+    assert TypedIdTableScreen.schema() == %{
+             devices: %{
+               order: ["dev-1", "dev-2"],
+               by_id: %{
+                 "dev-1" => %{name: "Kitchen", status: "Online", pos: 1, load: 0.5, online: true},
+                 "dev-2" => %{name: "Door", status: "Offline", pos: 2, load: 0.0, online: false}
+               }
+             }
+           }
+
+    assert [
+             %{
+               name: :devices,
+               type: :id_table,
+               default: default,
+               opts: [columns: columns]
+             }
+           ] = TypedIdTableScreen.__projection_schema__()
+
+    assert default == TypedIdTableScreen.schema()[:devices]
+
+    assert columns == [
+             %{name: :name, type: :string},
+             %{name: :status, type: :string},
+             %{name: :pos, type: :integer},
+             %{name: :load, type: :float},
+             %{name: :online, type: :bool}
+           ]
+
+    assert :ok == Schema.validate_render!(TypedIdTableScreen)
+  end
+
+  test "schema rejects unsupported typed id_table column types" do
+    module_name = :"InvalidIdTableColumnType#{System.unique_integer([:positive])}"
+    module = Module.concat([Projection, module_name])
+
+    assert_raise CompileError, ~r/:id_table columns must use one of/, fn ->
+      Code.compile_string("""
+      defmodule #{inspect(module)} do
+        use ProjectionUI, :screen
+        schema do
+          field(:devices, :id_table, columns: [meta: :map], default: %{order: [], by_id: %{}})
+        end
+      end
+      """)
+    end
+  end
+
+  test "schema rejects id_table defaults that do not match typed columns" do
+    module_name = :"InvalidIdTableDefault#{System.unique_integer([:positive])}"
+    module = Module.concat([Projection, module_name])
+
+    assert_raise CompileError, ~r/invalid default for :devices/, fn ->
+      Code.compile_string("""
+      defmodule #{inspect(module)} do
+        use ProjectionUI, :screen
+        schema do
+          field(:devices, :id_table,
+            columns: [name: :string, pos: :integer],
+            default: %{
+              order: ["dev-1"],
+              by_id: %{
+                "dev-1" => %{name: "Kitchen", pos: "1"}
+              }
+            }
+          )
+        end
+      end
+      """)
+    end
   end
 
   test "schema rejects invalid :list item type option" do

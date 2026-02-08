@@ -220,7 +220,10 @@ defmodule Projection.TestScreens.Devices do
   use ProjectionUI, :screen
 
   schema do
-    field(:devices, :id_table, columns: [:name, :status], default: %{order: [], by_id: %{}})
+    field(:devices, :id_table,
+      columns: [name: :string, status: :string],
+      default: %{order: [], by_id: %{}}
+    )
   end
 
   @impl true

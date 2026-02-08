@@ -185,6 +185,96 @@ defmodule Projection.CompileProjectionCodegenTaskTest do
     assert screen_rs =~ "let model = slint::VecModel::from(parsed);"
   end
 
+  test "projection.codegen emits typed id_table column bindings" do
+    module_name = :"TypedIdTableScreen#{System.unique_integer([:positive])}"
+    module = Module.concat([Projection, module_name])
+
+    source = """
+    defmodule #{inspect(module)} do
+      use ProjectionUI, :screen
+
+      schema do
+        field(:devices, :id_table,
+          columns: [name: :string, pos: :integer, load: :float, online: :bool],
+          default: %{
+            order: ["dev-1", "dev-2"],
+            by_id: %{
+              "dev-1" => %{name: "A", pos: 1, load: 0.5, online: true},
+              "dev-2" => %{name: "B", pos: 2, load: 1.0, online: false}
+            }
+          }
+        )
+      end
+
+      @impl true
+      def render(assigns), do: assigns
+    end
+    """
+
+    Code.compile_string(source)
+
+    original_router_module = Application.get_env(:projection, :router_module)
+    original_screen_modules = Application.get_env(:projection, :screen_modules)
+    Application.delete_env(:projection, :router_module)
+    Application.put_env(:projection, :screen_modules, [module])
+
+    on_exit(fn ->
+      if original_router_module do
+        Application.put_env(:projection, :router_module, original_router_module)
+      else
+        Application.delete_env(:projection, :router_module)
+      end
+
+      if is_nil(original_screen_modules) do
+        Application.delete_env(:projection, :screen_modules)
+      else
+        Application.put_env(:projection, :screen_modules, original_screen_modules)
+      end
+
+      Mix.Task.reenable("projection.codegen")
+
+      capture_io(fn ->
+        previous_allow_empty = System.get_env("PROJECTION_ALLOW_EMPTY")
+        System.put_env("PROJECTION_ALLOW_EMPTY", "1")
+
+        try do
+          Mix.Tasks.Projection.Codegen.run([])
+        after
+          if is_nil(previous_allow_empty) do
+            System.delete_env("PROJECTION_ALLOW_EMPTY")
+          else
+            System.put_env("PROJECTION_ALLOW_EMPTY", previous_allow_empty)
+          end
+        end
+      end)
+    end)
+
+    Mix.Task.reenable("projection.codegen")
+
+    capture_io(fn ->
+      Mix.Tasks.Projection.Codegen.run([])
+    end)
+
+    screen_name =
+      module
+      |> Module.split()
+      |> List.last()
+      |> Macro.underscore()
+
+    state_slint = File.read!("slint/ui_host/src/generated/#{screen_name}_state.slint")
+    assert state_slint =~ "in property <[string]> devices_ids: [\"dev-1\", \"dev-2\"];"
+    assert state_slint =~ "in property <[string]> devices_name: [\"A\", \"B\"];"
+    assert state_slint =~ "in property <[int]> devices_pos: [1, 2];"
+    assert state_slint =~ ~r/in property <\[float\]> devices_load: \[0\.5, (1|1\.0)\];/
+    assert state_slint =~ "in property <[bool]> devices_online: [true, false];"
+
+    screen_rs = File.read!("slint/ui_host/src/generated/#{screen_name}.rs")
+    assert screen_rs =~ "columns: std::collections::BTreeMap<String, Vec<Value>>"
+    assert screen_rs =~ "parse_integer_list(&Value::Array(raw_values)"
+    assert screen_rs =~ "parse_float_list(&Value::Array(raw_values)"
+    assert screen_rs =~ "parse_bool_list(&Value::Array(raw_values)"
+  end
+
   test "projection.codegen maps aliased route names to the referenced screen id" do
     original_router_module = Application.get_env(:projection, :router_module)
     original_screen_modules = Application.get_env(:projection, :screen_modules)

@@ -437,7 +437,7 @@ defmodule Mix.Tasks.Projection.Codegen do
   end
 
   defp expand_codegen_field(%{name: name, type: :id_table, default: default, opts: opts}) do
-    columns = Keyword.get(opts, :columns, [])
+    columns = id_table_columns(opts)
 
     ids_default = Map.get(default, :order, [])
 
@@ -450,15 +450,15 @@ defmodule Mix.Tasks.Projection.Codegen do
     }
 
     column_fields =
-      Enum.map(columns, fn column ->
+      Enum.map(columns, fn %{name: column_name, type: column_type} = column ->
         column_values_default = id_table_column_values(default, column)
 
         %{
-          name: :"#{name}_#{column}",
+          name: :"#{name}_#{column_name}",
           type: :list,
           default: column_values_default,
-          opts: [items: :string],
-          source: %{kind: :id_table, root: name, role: {:column, column}}
+          opts: [items: column_type],
+          source: %{kind: :id_table, root: name, role: {:column, column_name}}
         }
       end)
 
@@ -493,7 +493,7 @@ defmodule Mix.Tasks.Projection.Codegen do
          %{name: field_name, type: :id_table, opts: opts},
          component_default
        ) do
-    columns = Keyword.get(opts, :columns, [])
+    columns = id_table_columns(opts)
     ids_default = Map.get(component_default, :order, [])
 
     id_field = %{
@@ -510,19 +510,19 @@ defmodule Mix.Tasks.Projection.Codegen do
     }
 
     column_fields =
-      Enum.map(columns, fn column ->
+      Enum.map(columns, fn %{name: column_name, type: column_type} = column ->
         column_values_default = id_table_column_values(component_default, column)
 
         %{
-          name: :"#{component_root}_#{field_name}_#{column}",
+          name: :"#{component_root}_#{field_name}_#{column_name}",
           type: :list,
           default: column_values_default,
-          opts: [items: :string],
+          opts: [items: column_type],
           source: %{
             kind: :component_id_table,
             component: component_root,
             root: field_name,
-            role: {:column, column}
+            role: {:column, column_name}
           }
         }
       end)
@@ -919,7 +919,7 @@ defmodule Mix.Tasks.Projection.Codegen do
         |> Enum.join("\n")
 
       parse_helpers =
-        (direct_fields ++ component_fields)
+        (direct_fields ++ component_fields ++ id_table_fields ++ component_id_table_fields)
         |> Enum.map(&parse_helper_key/1)
         |> Enum.uniq()
         |> Enum.sort_by(&parse_helper_sort_key/1)
@@ -1105,24 +1105,25 @@ defmodule Mix.Tasks.Projection.Codegen do
   defp render_field_helper(
          %{
            name: name,
+           opts: opts,
            default: default,
            source: %{kind: :id_table, root: _root, role: role}
          },
          global_name
        ) do
     field = Atom.to_string(name)
-    default_literal = rust_literal(:list, default)
-    extract_expr = rust_id_table_extract_expr(role)
+    default_literal = rust_literal(:list, default, opts)
+    extract_expr = rust_id_table_extract_expr(role, opts)
+    model_expr = rust_list_model_from_values_expr(opts, "values", "path")
 
     """
-    fn set_#{field}_from_parsed(g: &#{global_name}, parsed: &IdTableParsed) -> Result<(), String> {
+    fn set_#{field}_from_parsed(
+        g: &#{global_name},
+        parsed: &IdTableParsed,
+        path: &str,
+    ) -> Result<(), String> {
         #{extract_expr}
-        let model = slint::VecModel::from(
-            values
-                .into_iter()
-                .map(slint::SharedString::from)
-                .collect::<Vec<slint::SharedString>>(),
-        );
+        #{model_expr}
         g.set_#{field}(slint::ModelRc::new(model));
         Ok(())
     }
@@ -1136,24 +1137,25 @@ defmodule Mix.Tasks.Projection.Codegen do
   defp render_field_helper(
          %{
            name: name,
+           opts: opts,
            default: default,
            source: %{kind: :component_id_table, component: _component, root: _root, role: role}
          },
          global_name
        ) do
     field = Atom.to_string(name)
-    default_literal = rust_literal(:list, default)
-    extract_expr = rust_id_table_extract_expr(role)
+    default_literal = rust_literal(:list, default, opts)
+    extract_expr = rust_id_table_extract_expr(role, opts)
+    model_expr = rust_list_model_from_values_expr(opts, "values", "path")
 
     """
-    fn set_#{field}_from_parsed(g: &#{global_name}, parsed: &IdTableParsed) -> Result<(), String> {
+    fn set_#{field}_from_parsed(
+        g: &#{global_name},
+        parsed: &IdTableParsed,
+        path: &str,
+    ) -> Result<(), String> {
         #{extract_expr}
-        let model = slint::VecModel::from(
-            values
-                .into_iter()
-                .map(slint::SharedString::from)
-                .collect::<Vec<slint::SharedString>>(),
-        );
+        #{model_expr}
         g.set_#{field}(slint::ModelRc::new(model));
         Ok(())
     }
@@ -1328,17 +1330,31 @@ defmodule Mix.Tasks.Projection.Codegen do
     "field_path == \"#{top_path}\" || field_path.starts_with(\"#{top_path}/\")"
   end
 
-  defp rust_id_table_extract_expr(:ids), do: "let values = parsed.ids.clone();"
+  defp rust_id_table_extract_expr(:ids, _opts) do
+    """
+    let _ = path;
+    let values = parsed.ids.clone();
+    """
+  end
 
-  defp rust_id_table_extract_expr({:column, column}) do
+  defp rust_id_table_extract_expr({:column, column}, opts) do
     column_name = Atom.to_string(column)
+    parse_fn = rust_list_parse_fn(opts)
 
     """
-    let values = parsed
+    let raw_values = parsed
             .columns
             .get("#{column_name}")
             .cloned()
             .ok_or_else(|| format!("missing id_table column '#{column_name}'"))?;
+    if raw_values.len() != parsed.ids.len() {
+        return Err(format!(
+            "inconsistent id_table column '#{column_name}' length: expected {}, got {}",
+            parsed.ids.len(),
+            raw_values.len()
+        ));
+    }
+    let values = #{parse_fn}(&Value::Array(raw_values), &format!("{path}/#{column_name}"))?;
     """
   end
 
@@ -1348,7 +1364,7 @@ defmodule Mix.Tasks.Projection.Codegen do
     parsed_setters =
       fields
       |> Enum.map_join("\n", fn field ->
-        "    set_#{field.name}_from_parsed(g, &parsed)?;"
+        "    set_#{field.name}_from_parsed(g, &parsed, path)?;"
       end)
 
     defaults =
@@ -1389,7 +1405,7 @@ defmodule Mix.Tasks.Projection.Codegen do
     parsed_setters =
       fields
       |> Enum.map_join("\n", fn field ->
-        "    set_#{field.name}_from_parsed(g, &parsed)?;"
+        "    set_#{field.name}_from_parsed(g, &parsed, path)?;"
       end)
 
     defaults =
@@ -1472,7 +1488,7 @@ defmodule Mix.Tasks.Projection.Codegen do
 
   defp rust_set_value_expr(name, :list, opts, setter_target) do
     parse_fn = rust_list_parse_fn(opts)
-    model_expr = rust_list_model_from_parsed_expr(opts)
+    model_expr = rust_list_model_from_values_expr(opts, "parsed", "path")
 
     """
     let parsed = #{parse_fn}(value, path)?;
@@ -1481,8 +1497,6 @@ defmodule Mix.Tasks.Projection.Codegen do
         Ok(())
     """
   end
-
-  defp rust_literal(type, value), do: rust_literal(type, value, [])
 
   defp rust_literal(:string, value, _opts), do: "\"#{escape_string(value)}\".into()"
   defp rust_literal(:bool, true, _opts), do: "true"
@@ -1644,7 +1658,7 @@ defmodule Mix.Tasks.Projection.Codegen do
     """
     struct IdTableParsed {
         ids: Vec<String>,
-        columns: std::collections::BTreeMap<String, Vec<String>>,
+        columns: std::collections::BTreeMap<String, Vec<Value>>,
     }
 
     fn parse_id_table(value: &Value, path: &str) -> Result<IdTableParsed, String> {
@@ -1663,7 +1677,7 @@ defmodule Mix.Tasks.Projection.Codegen do
             .ok_or_else(|| format!("missing id_table by_id at path {path}"))?;
 
         let mut ids = Vec::with_capacity(order.len());
-        let mut columns: std::collections::BTreeMap<String, Vec<String>> =
+        let mut columns: std::collections::BTreeMap<String, Vec<Value>> =
             std::collections::BTreeMap::new();
 
         for (index, id_value) in order.iter().enumerate() {
@@ -1680,14 +1694,10 @@ defmodule Mix.Tasks.Projection.Codegen do
             ids.push(id);
 
             for (column, column_value) in row {
-                let text = column_value.as_str().ok_or_else(|| {
-                    format!("expected string in id_table column '{column}' at path {path}")
-                })?;
-
                 columns
                     .entry(column.clone())
                     .or_insert_with(Vec::new)
-                    .push(text.to_owned());
+                    .push(column_value.clone());
             }
         }
 
@@ -1851,31 +1861,62 @@ defmodule Mix.Tasks.Projection.Codegen do
     """
   end
 
-  defp id_table_column_values(%{order: order, by_id: by_id}, column)
-       when is_list(order) and is_map(by_id) and is_atom(column) do
-    column_key = Atom.to_string(column)
+  defp id_table_columns(opts) when is_list(opts) do
+    opts
+    |> Keyword.get(:columns, [])
+    |> Enum.map(&normalize_id_table_column!/1)
+  end
 
+  defp id_table_columns(_opts), do: []
+
+  defp normalize_id_table_column!(%{name: name, type: type})
+       when is_atom(name) and type in [:string, :integer, :float, :bool] do
+    %{name: name, type: type}
+  end
+
+  defp normalize_id_table_column!({name, type})
+       when is_atom(name) and type in [:string, :integer, :float, :bool] do
+    %{name: name, type: type}
+  end
+
+  defp normalize_id_table_column!(column) do
+    raise ArgumentError,
+          "invalid id_table column metadata for codegen: #{inspect(column)}"
+  end
+
+  defp id_table_column_values(%{order: order, by_id: by_id}, %{name: column, type: column_type})
+       when is_list(order) and is_map(by_id) and is_atom(column) and
+              column_type in [:string, :integer, :float, :bool] do
     Enum.map(order, fn id ->
       row = Map.get(by_id, id, %{})
 
-      cond do
-        is_map(row) and Map.has_key?(row, column_key) ->
-          Map.get(row, column_key)
+      value =
+        cond do
+          is_map(row) and Map.has_key?(row, column) ->
+            Map.get(row, column)
 
-        is_map(row) and Map.has_key?(row, column) ->
-          Map.get(row, column)
+          is_map(row) and Map.has_key?(row, Atom.to_string(column)) ->
+            Map.get(row, Atom.to_string(column))
 
-        true ->
-          ""
-      end
-    end)
-    |> Enum.map(fn
-      value when is_binary(value) -> value
-      _ -> ""
+          true ->
+            nil
+        end
+
+      normalize_id_table_column_value(value, column_type)
     end)
   end
 
   defp id_table_column_values(_default, _column), do: []
+
+  defp normalize_id_table_column_value(value, :string) when is_binary(value), do: value
+  defp normalize_id_table_column_value(value, :integer) when is_integer(value), do: value
+  defp normalize_id_table_column_value(value, :float) when is_float(value), do: value
+  defp normalize_id_table_column_value(value, :bool) when is_boolean(value), do: value
+
+  defp normalize_id_table_column_value(_value, :string), do: ""
+  defp normalize_id_table_column_value(_value, :integer), do: 0
+  defp normalize_id_table_column_value(_value, :float), do: 0.0
+  defp normalize_id_table_column_value(_value, :bool), do: false
 
   defp render_screen_host_nav_item(route) do
     route_id = slint_identifier(route.route_key)
@@ -2113,12 +2154,12 @@ defmodule Mix.Tasks.Projection.Codegen do
     end
   end
 
-  defp rust_list_model_from_parsed_expr(opts) do
+  defp rust_list_model_from_values_expr(opts, values_var, path_var) do
     case list_item_type(opts) do
       :string ->
         """
         let model = slint::VecModel::from(
-            parsed
+            #{values_var}
                 .into_iter()
                 .map(slint::SharedString::from)
                 .collect::<Vec<slint::SharedString>>(),
@@ -2127,11 +2168,11 @@ defmodule Mix.Tasks.Projection.Codegen do
 
       :integer ->
         """
-        let values = parsed
+        let values = #{values_var}
             .into_iter()
             .map(|entry| {
                 i32::try_from(entry)
-                    .map_err(|_| format!("value out of range for Slint int at path {path}: {entry}"))
+                    .map_err(|_| format!("value out of range for Slint int at path {#{path_var}}: {entry}"))
             })
             .collect::<Result<Vec<i32>, String>>()?;
         let model = slint::VecModel::from(values);
@@ -2139,14 +2180,14 @@ defmodule Mix.Tasks.Projection.Codegen do
 
       :float ->
         """
-        let values = parsed
+        let values = #{values_var}
             .into_iter()
             .map(|entry| {
                 let casted = entry as f32;
                 if casted.is_finite() {
                     Ok(casted)
                 } else {
-                    Err(format!("non-finite float at path {path}: {entry}"))
+                    Err(format!("non-finite float at path {#{path_var}}: {entry}"))
                 }
             })
             .collect::<Result<Vec<f32>, String>>()?;
@@ -2155,7 +2196,7 @@ defmodule Mix.Tasks.Projection.Codegen do
 
       :bool ->
         """
-        let model = slint::VecModel::from(parsed);
+        let model = slint::VecModel::from(#{values_var});
         """
     end
   end
