@@ -44,7 +44,7 @@ defmodule ProjectionUI.Schema do
   defmacro __using__(opts) do
     owner = Keyword.get(opts, :owner)
 
-    if owner in [:screen, :component] do
+    if owner in [:screen, :component, :app_state] do
       Module.put_attribute(__CALLER__.module, :projection_schema_owner, owner)
     end
 

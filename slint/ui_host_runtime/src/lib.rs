@@ -50,6 +50,18 @@ pub trait HostBindings {
         vm: &Value,
     ) -> Result<(), String>;
 
+    fn apply_app_render(_ui: &Self::Ui, _vm: &Value) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn apply_app_patch(
+        _ui: &Self::Ui,
+        _ops: &[PatchOp],
+        _vm: &Value,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+
     fn patch_changes_screen(path: &str) -> bool {
         path == "/screen/name"
     }
@@ -424,6 +436,7 @@ fn apply_render<B: HostBindings>(
 ) -> Result<(), String> {
     ui_model_state.vm = vm.clone();
     apply_global_props::<B>(ui, &ui_model_state.vm);
+    B::apply_app_render(ui, &ui_model_state.vm)?;
     let screen_id = B::apply_screen_render(ui, vm)?;
     ui_model_state.screen_id = screen_id;
     Ok(())
@@ -436,6 +449,7 @@ fn apply_patch<B: HostBindings>(
 ) -> Result<(), String> {
     apply_vm_patch_ops(&mut ui_model_state.vm, ops)?;
     apply_global_props::<B>(ui, &ui_model_state.vm);
+    B::apply_app_patch(ui, ops, &ui_model_state.vm)?;
 
     if patch_changes_screen::<B>(ops) {
         let screen_id = B::apply_screen_render(ui, &ui_model_state.vm)?;
@@ -851,6 +865,21 @@ macro_rules! app_main {
                 vm: &$crate::serde_json::Value,
             ) -> Result<(), String> {
                 $generated::apply_patch(ui, screen_id, ops, vm)
+            }
+
+            fn apply_app_render(
+                ui: &Self::Ui,
+                vm: &$crate::serde_json::Value,
+            ) -> Result<(), String> {
+                $generated::apply_app_render(ui, vm)
+            }
+
+            fn apply_app_patch(
+                ui: &Self::Ui,
+                ops: &[$crate::PatchOp],
+                vm: &$crate::serde_json::Value,
+            ) -> Result<(), String> {
+                $generated::apply_app_patch(ui, ops, vm)
             }
         }
 

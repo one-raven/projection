@@ -13,6 +13,7 @@ defmodule Mix.Tasks.Compile.ProjectionCodegen do
     {:ok, []}
   rescue
     error ->
+      Mix.shell().error("projection_codegen failed: #{Exception.message(error)}")
       {:error, ["projection_codegen failed: #{Exception.message(error)}"]}
   end
 end

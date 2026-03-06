@@ -3,10 +3,15 @@ name = "ui_host"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+default = ["desktop"]
+desktop = ["slint/backend-winit"]
+kms = ["slint/backend-linuxkms-noseat"]
+
 [dependencies]
 projection_ui_host_runtime = { path = "../ui_host_runtime" }
 serde_json = "1.0.149"
-slint = { version = "=1.15.0", default-features = false, features = ["std", "backend-winit", "renderer-software", "compat-1-2"] }
+slint = { version = "=1.15.0", default-features = false, features = ["std", "renderer-software", "compat-1-2"] }
 
 [build-dependencies]
 slint-build = "=1.15.0"

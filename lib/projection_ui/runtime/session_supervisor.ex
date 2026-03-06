@@ -18,6 +18,7 @@ defmodule ProjectionUI.SessionSupervisor do
     * `:session_name` — registered name for the session (default: `Projection.Session`)
     * `:host_bridge_name` — registered name for the bridge (default: `ProjectionUI.HostBridge`)
     * `:command` — path to the UI host executable
+    * `:stderr_to_stdout` — whether to merge host stderr into the protocol stream
 
   You must provide either `:router` or `:screen_module`.
 
@@ -64,7 +65,8 @@ defmodule ProjectionUI.SessionSupervisor do
          command: Keyword.get(opts, :command),
          args: Keyword.get(opts, :args, []),
          env: Keyword.get(opts, :env, []),
-         cd: Keyword.get(opts, :cd, File.cwd!())
+         cd: Keyword.get(opts, :cd, File.cwd!()),
+         stderr_to_stdout: Keyword.get(opts, :stderr_to_stdout, false)
        ]}
     ]
 

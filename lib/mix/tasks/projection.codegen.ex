@@ -18,7 +18,6 @@ defmodule Mix.Tasks.Projection.Codegen do
 
     router_module = discover_router_module()
     routes = discover_routes(router_module)
-    nav_routes = discover_nav_routes(router_module, routes)
     ui_root = configured_ui_root()
     ui_root_from_generated = ui_root_from_generated(ui_root)
     ui_root_from_ui_host = ui_root_from_ui_host(ui_root)
@@ -27,6 +26,9 @@ defmodule Mix.Tasks.Projection.Codegen do
       discover_screen_modules(routes)
       |> Enum.map(&build_screen_spec/1)
       |> Enum.sort_by(& &1.module_name)
+
+    app_module = discover_app_module()
+    app_spec = if app_module, do: build_app_state_spec(app_module), else: nil
 
     ensure_codegen_targets!(specs, routes)
     ensure_required_ui_shell_files!(specs, routes, ui_root)
@@ -60,10 +62,26 @@ defmodule Mix.Tasks.Projection.Codegen do
       )
       |> Enum.map(&unwrap_task_result!/1)
 
+    app_state_results =
+      if app_spec do
+        [
+          write_file_if_changed(
+            Path.join(generated_dir, "app_state.rs"),
+            render_app_state_module(app_spec)
+          ),
+          write_file_if_changed(
+            Path.join(generated_dir, "app_state.slint"),
+            render_app_state_slint(app_spec)
+          )
+        ]
+      else
+        []
+      end
+
     mod_result =
       write_file_if_changed(
         Path.join(generated_dir, "mod.rs"),
-        render_generated_mod(specs, routes)
+        render_generated_mod(specs, routes, app_spec)
       )
 
     routes_result =
@@ -72,13 +90,13 @@ defmodule Mix.Tasks.Projection.Codegen do
     screen_host_result =
       write_file_if_changed(
         Path.join(generated_dir, "screen_host.slint"),
-        render_screen_host_slint(specs, routes, nav_routes, ui_root_from_generated)
+        render_screen_host_slint(specs, routes, ui_root_from_generated)
       )
 
     app_result =
       write_file_if_changed(
         Path.join(generated_dir, "app.slint"),
-        render_generated_app_slint(specs, routes, ui_root_from_generated)
+        render_generated_app_slint(specs, routes, ui_root_from_generated, app_spec)
       )
 
     error_state_result =
@@ -90,15 +108,16 @@ defmodule Mix.Tasks.Projection.Codegen do
     build_rs_result =
       write_file_if_changed(
         Path.join(File.cwd!(), "slint/ui_host/build.rs"),
-        render_build_rs(specs, ui_root_from_ui_host)
+        render_build_rs(specs, ui_root_from_ui_host, app_spec)
       )
 
-    removed_count = prune_stale_generated_files(generated_dir, specs)
+    removed_count = prune_stale_generated_files(generated_dir, specs, app_spec)
 
     written_count =
       Enum.count(
         screen_results ++
           screen_state_results ++
+          app_state_results ++
           [
             mod_result,
             routes_result,
@@ -146,24 +165,6 @@ defmodule Mix.Tasks.Projection.Codegen do
       end)
     else
       []
-    end
-  end
-
-  defp discover_nav_routes(nil, _routes), do: []
-  defp discover_nav_routes(_router_module, []), do: []
-
-  defp discover_nav_routes(router_module, routes) do
-    with true <- Code.ensure_loaded?(router_module),
-         true <- function_exported?(router_module, :default_route_name, 0),
-         default_route_name when is_binary(default_route_name) <-
-           router_module.default_route_name(),
-         %{screen_session: session_name} <- Enum.find(routes, &(&1.name == default_route_name)) do
-      routes
-      |> Enum.filter(&(&1.screen_session == session_name))
-      |> Enum.uniq_by(& &1.name)
-    else
-      _ ->
-        routes
     end
   end
 
@@ -230,6 +231,42 @@ defmodule Mix.Tasks.Projection.Codegen do
     |> Enum.filter(&Code.ensure_loaded?/1)
     |> Enum.filter(&function_exported?(&1, :__projection_schema__, 0))
     |> Enum.sort_by(&Atom.to_string/1)
+  end
+
+  defp discover_app_module do
+    case Application.get_env(:projection, :app_module) do
+      module when is_atom(module) and not is_nil(module) ->
+        if Code.ensure_loaded?(module) and
+             function_exported?(module, :__projection_app_state__, 0) and
+             function_exported?(module, :__projection_schema__, 0) do
+          module
+        else
+          Mix.raise("configured app_module #{inspect(module)} must use ProjectionUI, :app_state")
+        end
+
+      _ ->
+        nil
+    end
+  end
+
+  defp build_app_state_spec(module) do
+    metadata = module.__projection_schema__()
+
+    fields =
+      metadata
+      |> Enum.map(&normalize_field!/1)
+      |> Enum.sort_by(&Atom.to_string(&1.name))
+
+    codegen_fields =
+      fields
+      |> Enum.flat_map(&expand_codegen_field/1)
+
+    %{
+      module: module,
+      module_name: Atom.to_string(module),
+      global_name: "AppState",
+      fields: codegen_fields
+    }
   end
 
   defp ensure_codegen_targets!([], routes) when is_list(routes) do
@@ -594,7 +631,10 @@ defmodule Mix.Tasks.Projection.Codegen do
     System.schedulers_online()
   end
 
-  defp prune_stale_generated_files(generated_dir, specs) do
+  defp prune_stale_generated_files(generated_dir, specs, app_spec) do
+    app_state_files =
+      if app_spec, do: ["app_state.rs", "app_state.slint"], else: []
+
     keep =
       MapSet.new(
         [
@@ -604,6 +644,7 @@ defmodule Mix.Tasks.Projection.Codegen do
           "app.slint",
           "error_state.slint"
         ] ++
+          app_state_files ++
           Enum.map(specs, &"#{&1.file_name}.rs") ++
           Enum.map(specs, & &1.state_file)
       )
@@ -628,12 +669,15 @@ defmodule Mix.Tasks.Projection.Codegen do
     end)
   end
 
-  defp render_generated_mod([], _routes) do
+  defp render_generated_mod([], _routes, app_spec) do
+    app_state_mod_line = if app_spec, do: "\n#[rustfmt::skip]\npub mod app_state;\n", else: ""
+    app_render_fn = render_app_render_fn(app_spec)
+
     """
     use crate::AppWindow;
     use projection_ui_host_runtime::PatchOp;
     use serde_json::Value;
-
+    #{app_state_mod_line}
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
     pub enum ScreenId {
         #[default]
@@ -652,11 +696,15 @@ defmodule Mix.Tasks.Projection.Codegen do
     ) -> Result<(), String> {
         Ok(())
     }
+
+    #{app_render_fn}
     """
   end
 
-  defp render_generated_mod(specs, routes) do
+  defp render_generated_mod(specs, routes, app_spec) do
     [first | rest] = specs
+
+    app_state_mod_line = if app_spec, do: "#[rustfmt::skip]\npub mod app_state;", else: ""
 
     module_lines =
       specs
@@ -691,12 +739,15 @@ defmodule Mix.Tasks.Projection.Codegen do
         "        ScreenId::#{camelize(spec.screen_name)} => #{spec.file_name}::apply_patch(ui, ops, vm),"
       end)
 
+    app_render_fn = render_app_render_fn(app_spec)
+
     """
     use crate::AppWindow;
     use projection_ui_host_runtime::PatchOp;
     use serde_json::Value;
 
     #{module_lines}
+    #{app_state_mod_line}
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
     pub enum ScreenId {
@@ -726,6 +777,32 @@ defmodule Mix.Tasks.Projection.Codegen do
         match screen_id {
     #{patch_dispatch_arms}
         }
+    }
+
+    #{app_render_fn}
+    """
+  end
+
+  defp render_app_render_fn(app_spec) when app_spec != nil do
+    """
+    pub fn apply_app_render(ui: &AppWindow, vm: &Value) -> Result<(), String> {
+        app_state::apply_render(ui, vm)
+    }
+
+    pub fn apply_app_patch(ui: &AppWindow, ops: &[PatchOp], vm: &Value) -> Result<(), String> {
+        app_state::apply_patch(ui, ops, vm)
+    }
+    """
+  end
+
+  defp render_app_render_fn(_app_spec) do
+    """
+    pub fn apply_app_render(_ui: &AppWindow, _vm: &Value) -> Result<(), String> {
+        Ok(())
+    }
+
+    pub fn apply_app_patch(_ui: &AppWindow, _ops: &[PatchOp], _vm: &Value) -> Result<(), String> {
+        Ok(())
     }
     """
   end
@@ -1755,13 +1832,178 @@ defmodule Mix.Tasks.Projection.Codegen do
     """
   end
 
-  defp render_build_rs(specs, ui_root_from_ui_host) do
+  defp render_app_state_slint(app_spec) do
+    property_lines =
+      app_spec.fields
+      |> Enum.map_join("\n", fn field ->
+        opts = Map.get(field, :opts, [])
+
+        "    in property <#{slint_type(field.type, opts)}> #{field.name}: #{slint_literal(field.type, field.default, opts)};"
+      end)
+
+    """
+    // generated by mix projection.codegen; do not edit manually
+    export global AppState {
+    #{property_lines}
+    }
+    """
+  end
+
+  defp render_app_state_module(app_spec) do
+    if app_spec.fields == [] do
+      render_empty_app_state_module()
+    else
+      global_name = app_spec.global_name
+      global_type = "crate::#{global_name}"
+      fields = app_spec.fields
+
+      # App state only supports direct fields (no components or id_tables expected, but use same expand_codegen_field)
+      direct_fields = Enum.filter(fields, &(&1.source.kind == :direct))
+
+      render_setters =
+        direct_fields
+        |> Enum.map_join("\n", fn field ->
+          "        set_#{field.name}_from_vm(&g, app_vm)?;"
+        end)
+
+      patch_apply_lines =
+        direct_fields
+        |> Enum.map_join("\n", fn field ->
+          field_name = Atom.to_string(field.name)
+
+          """
+                          if field_path == "/#{field_name}" {
+                              set_#{field_name}_from_value(&g, path, value)?;
+                          }
+          """
+        end)
+
+      remove_apply_lines =
+        direct_fields
+        |> Enum.map_join("\n", fn field ->
+          field_name = Atom.to_string(field.name)
+
+          """
+                          if field_path == "/#{field_name}" {
+                              set_#{field_name}_default(&g);
+                          }
+          """
+        end)
+
+      field_helpers =
+        direct_fields
+        |> Enum.map_join("\n", fn field ->
+          render_app_state_field_helper(field, global_type)
+        end)
+
+      parse_helpers =
+        direct_fields
+        |> Enum.map(&parse_helper_key/1)
+        |> Enum.uniq()
+        |> Enum.sort_by(&parse_helper_sort_key/1)
+        |> Enum.map_join("\n", &render_parse_helper/1)
+
+      """
+      use crate::AppWindow;
+      use projection_ui_host_runtime::PatchOp;
+      use slint::ComponentHandle;
+      use serde_json::Value;
+
+      pub fn apply_render(ui: &AppWindow, vm: &Value) -> Result<(), String> {
+          let app_vm = vm.pointer("/app").and_then(Value::as_object);
+          let g = ui.global::<#{global_type}>();
+      #{render_setters}
+          Ok(())
+      }
+
+      pub fn apply_patch(ui: &AppWindow, ops: &[PatchOp], _vm: &Value) -> Result<(), String> {
+          let g = ui.global::<#{global_type}>();
+          for op in ops {
+              match op {
+                  PatchOp::Replace { path, value } | PatchOp::Add { path, value } => {
+                      let field_path = path.strip_prefix("/app").unwrap_or(path);
+      #{patch_apply_lines}
+                  }
+                  PatchOp::Remove { path } => {
+                      let field_path = path.strip_prefix("/app").unwrap_or(path);
+      #{remove_apply_lines}
+                  }
+              }
+          }
+
+          Ok(())
+      }
+
+      #{field_helpers}
+
+      #{parse_helpers}
+      """
+    end
+  end
+
+  defp render_empty_app_state_module do
+    """
+    use crate::AppWindow;
+    use projection_ui_host_runtime::PatchOp;
+    use serde_json::Value;
+
+    pub fn apply_render(_ui: &AppWindow, _vm: &Value) -> Result<(), String> {
+        Ok(())
+    }
+
+    pub fn apply_patch(_ui: &AppWindow, _ops: &[PatchOp], _vm: &Value) -> Result<(), String> {
+        Ok(())
+    }
+    """
+  end
+
+  defp render_app_state_field_helper(
+         %{name: name, type: type, default: default, opts: opts, source: %{kind: :direct}},
+         global_name
+       ) do
+    field = Atom.to_string(name)
+    default_literal = rust_literal(type, default, opts)
+    set_value_expr = rust_set_value_expr(name, type, opts, "g")
+
+    """
+    fn set_#{field}_from_vm(
+        g: &#{global_name},
+        app_vm: Option<&serde_json::Map<String, Value>>,
+    ) -> Result<(), String> {
+        if let Some(value) = app_vm.and_then(|root| root.get("#{field}")) {
+            return set_#{field}_from_value(g, "/app/#{field}", value);
+        }
+
+        set_#{field}_default(g);
+        Ok(())
+    }
+
+    fn set_#{field}_from_value(g: &#{global_name}, path: &str, value: &Value) -> Result<(), String> {
+        #{set_value_expr}
+    }
+
+    fn set_#{field}_default(g: &#{global_name}) {
+        g.set_#{field}(#{default_literal});
+    }
+    """
+  end
+
+  defp render_build_rs(specs, ui_root_from_ui_host, app_spec) do
     state_rerun_lines =
       specs
       |> Enum.map(fn spec ->
         "    println!(\"cargo:rerun-if-changed=src/generated/#{spec.state_file}\");"
       end)
       |> Enum.sort()
+
+    app_state_rerun_lines =
+      if app_spec do
+        [
+          "    println!(\"cargo:rerun-if-changed=src/generated/app_state.slint\");"
+        ]
+      else
+        []
+      end
 
     base_lines = [
       "fn main() {",
@@ -1775,12 +2017,13 @@ defmodule Mix.Tasks.Projection.Codegen do
 
     (base_lines ++
        state_rerun_lines ++
+       app_state_rerun_lines ++
        ["    println!(\"cargo:rerun-if-changed=#{ui_root_from_ui_host}/\");", "}"])
     |> Enum.join("\n")
     |> Kernel.<>("\n")
   end
 
-  defp render_screen_host_slint(specs, routes, nav_routes, ui_root_from_generated) do
+  defp render_screen_host_slint(specs, routes, ui_root_from_generated) do
     active_screen_default = default_active_screen(routes)
 
     spec_by_module = Map.new(specs, &{&1.module, &1})
@@ -1818,10 +2061,6 @@ defmodule Mix.Tasks.Projection.Codegen do
       (screen_import_lines ++ state_import_lines)
       |> Enum.join("\n")
 
-    nav_item_lines =
-      nav_routes
-      |> Enum.map_join("\n", &render_screen_host_nav_item/1)
-
     route_branch_lines =
       routes_with_specs
       |> Enum.map_join("\n", fn {route, spec} ->
@@ -1842,13 +2081,6 @@ defmodule Mix.Tasks.Projection.Codegen do
         callback navigate(route_name: string, params_json: string);
 
         spacing: 0px;
-
-        HorizontalLayout {
-            height: 36px;
-            spacing: 4px;
-            padding-bottom: 12px;
-    #{nav_item_lines}
-        }
 
     #{route_branch_lines}
 
@@ -1918,37 +2150,6 @@ defmodule Mix.Tasks.Projection.Codegen do
   defp normalize_id_table_column_value(_value, :float), do: 0.0
   defp normalize_id_table_column_value(_value, :bool), do: false
 
-  defp render_screen_host_nav_item(route) do
-    route_id = slint_identifier(route.route_key)
-    label = route_label(route.route_key)
-
-    """
-            Rectangle {
-                horizontal-stretch: 1;
-                height: 32px;
-                border-radius: 6px;
-                background: root.active_screen == Routes.#{route_id} ? #3a3a6a : (#{route_id}_touch.has-hover ? #2a2a4a : transparent);
-
-                Text {
-                    text: "#{escape_slint_string(label)}";
-                    font-size: 13px;
-                    font-weight: root.active_screen == Routes.#{route_id} ? 600 : 400;
-                    color: root.active_screen == Routes.#{route_id} ? #e0e0f0 : #8888bb;
-                    horizontal-alignment: center;
-                    vertical-alignment: center;
-                }
-
-                #{route_id}_touch := TouchArea {
-                    clicked => {
-                        if (root.active_screen != Routes.#{route_id}) {
-                            root.navigate(Routes.#{route_id}, "{}");
-                        }
-                    }
-                }
-            }
-    """
-  end
-
   defp render_screen_host_route_branch(route, spec) do
     route_id = slint_identifier(route.route_key)
     state_name = spec.global_name
@@ -1988,13 +2189,6 @@ defmodule Mix.Tasks.Projection.Codegen do
     |> String.replace("\"", "\\\"")
   end
 
-  defp route_label(route_key) when is_atom(route_key) do
-    route_key
-    |> Atom.to_string()
-    |> String.split("_", trim: true)
-    |> Enum.map_join(" ", &String.capitalize/1)
-  end
-
   defp slint_type(:string, _opts), do: "string"
   defp slint_type(:bool, _opts), do: "bool"
   defp slint_type(:integer, _opts), do: "int"
@@ -2016,7 +2210,7 @@ defmodule Mix.Tasks.Projection.Codegen do
   defp slint_literal(:float, value, _opts), do: format_float(value)
   defp slint_literal(:list, value, opts), do: slint_list_literal(value, opts)
 
-  defp render_generated_app_slint(specs, routes, ui_root_from_generated) do
+  defp render_generated_app_slint(specs, routes, ui_root_from_generated, app_spec) do
     active_screen_default = default_active_screen(routes)
 
     state_export_lines =
@@ -2027,6 +2221,19 @@ defmodule Mix.Tasks.Projection.Codegen do
       |> Enum.sort()
       |> Enum.join("\n")
 
+    app_state_export_line =
+      if app_spec do
+        "export { AppState } from \"app_state.slint\";"
+      else
+        ""
+      end
+
+    # AppShell owns navigation chrome. Wire active_tab and navigate through the shell.
+    shell_nav_props = """
+            active_tab: root.active_screen;
+            navigate(route) => { root.navigate(route, "{}"); }
+    """
+
     """
     // generated by mix projection.codegen; do not edit manually
     import { AppShell } from "#{ui_root_from_generated}/app_shell.slint";
@@ -2034,6 +2241,7 @@ defmodule Mix.Tasks.Projection.Codegen do
     export { UI } from "#{ui_root_from_generated}/ui.slint";
     #{state_export_lines}
     export { ErrorState } from "error_state.slint";
+    #{app_state_export_line}
 
     export component AppWindow inherits Window {
         in property <int> vm_rev: 0;
@@ -2048,7 +2256,7 @@ defmodule Mix.Tasks.Projection.Codegen do
             app_title: root.app_title;
             show_back: root.nav_can_back;
             nav_back => { root.ui_intent("ui.back", ""); }
-
+    #{shell_nav_props}
             ScreenHost {
                 vm_rev: root.vm_rev;
                 active_screen: root.active_screen;

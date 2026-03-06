@@ -17,6 +17,9 @@ defmodule ProjectionUI do
   DSL, and provides default implementations for all optional callbacks.
 
   Reusable component schemas can be declared with `use ProjectionUI, :component`.
+
+  App-level state (e.g. clock, connection status) that persists across screen
+  transitions can be declared with `use ProjectionUI, :app_state`.
   """
 
   @doc false
@@ -87,6 +90,32 @@ defmodule ProjectionUI do
                      handle_info: 2,
                      subscriptions: 2,
                      render: 1
+    end
+  end
+
+  @doc false
+  def app_state do
+    quote do
+      @behaviour ProjectionUI.AppState
+
+      alias ProjectionUI.State
+      import ProjectionUI.State, only: [assign: 3, update: 3]
+      use ProjectionUI.Schema, owner: :app_state
+
+      @doc false
+      @spec mount(State.t()) :: {:ok, State.t()}
+      @impl true
+      def mount(state) do
+        {:ok, state}
+      end
+
+      @doc false
+      @spec __projection_app_state__() :: true
+      def __projection_app_state__, do: true
+
+      @before_compile ProjectionUI.AppState
+
+      defoverridable mount: 1
     end
   end
 

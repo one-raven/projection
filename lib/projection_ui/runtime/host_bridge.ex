@@ -20,6 +20,7 @@ defmodule ProjectionUI.HostBridge do
 
   @backoff_steps_ms [100, 200, 500, 1_000, 2_000, 5_000]
   @event_error [:host_bridge, :error]
+  @min_stable_ms 2_000
 
   @typedoc "Internal state for the port owner process."
   @type state :: %{
@@ -30,7 +31,9 @@ defmodule ProjectionUI.HostBridge do
           args: [String.t()],
           env: [{String.t(), String.t()}],
           cd: String.t(),
-          reconnect_idx: non_neg_integer()
+          stderr_to_stdout: boolean(),
+          reconnect_idx: non_neg_integer(),
+          connected_at: integer() | nil
         }
 
   @doc """
@@ -44,6 +47,8 @@ defmodule ProjectionUI.HostBridge do
     * `:args` — command-line arguments for the host binary
     * `:env` — list of `{key, value}` environment variable tuples
     * `:cd` — working directory for the host process
+    * `:stderr_to_stdout` — when `true`, merges host stderr into the framed protocol stream
+      (default: `false`)
 
   """
   @spec start_link(keyword()) :: GenServer.on_start()
@@ -69,7 +74,9 @@ defmodule ProjectionUI.HostBridge do
       args: Keyword.get(opts, :args, []),
       env: Keyword.get(opts, :env, []),
       cd: Keyword.get(opts, :cd, File.cwd!()),
-      reconnect_idx: 0
+      stderr_to_stdout: Keyword.get(opts, :stderr_to_stdout, false),
+      reconnect_idx: 0,
+      connected_at: nil
     }
 
     state = maybe_connect(state)
@@ -116,16 +123,18 @@ defmodule ProjectionUI.HostBridge do
 
   def handle_info({port, {:exit_status, status}}, %{port: port} = state) do
     put_logger_metadata(state)
+    state = reset_backoff_if_stable(%{state | port: nil, connected_at: nil})
     Logger.warning("ui_host exited with status #{status}; scheduling reconnect")
     emit_error(:port_exit_status, state, %{status: status})
-    {:noreply, schedule_reconnect(%{state | port: nil})}
+    {:noreply, schedule_reconnect(state)}
   end
 
   def handle_info({:EXIT, port, reason}, %{port: port} = state) do
     put_logger_metadata(state)
+    state = reset_backoff_if_stable(%{state | port: nil, connected_at: nil})
     Logger.warning("ui_host port exit #{inspect(reason)}; scheduling reconnect")
     emit_error(:port_exit, state, %{reason: inspect(reason)})
-    {:noreply, schedule_reconnect(%{state | port: nil})}
+    {:noreply, schedule_reconnect(state)}
   end
 
   def handle_info(_msg, state) do
@@ -177,20 +186,38 @@ defmodule ProjectionUI.HostBridge do
             :binary,
             {:packet, 4},
             :exit_status,
-            :use_stdio,
-            :stderr_to_stdout,
+            :use_stdio
+          ]
+          |> maybe_include_stderr_to_stdout(state.stderr_to_stdout)
+          |> Kernel.++(
             args: state.args,
             env: normalize_env(state.env),
             cd: state.cd
-          ]
+          )
         )
 
-      %{state | port: port, reconnect_idx: 0}
+      Logger.info(
+        "ui_host port started command=#{state.command} args=#{inspect(state.args)} cd=#{state.cd}"
+      )
+
+      %{state | port: port, connected_at: System.monotonic_time(:millisecond)}
     rescue
       error ->
         Logger.warning("failed to start ui_host: #{Exception.message(error)}")
         emit_error(:connect_failed, state, %{error: Exception.message(error)})
         schedule_reconnect(state)
+    end
+  end
+
+  defp reset_backoff_if_stable(%{connected_at: nil} = state), do: state
+
+  defp reset_backoff_if_stable(%{connected_at: connected_at} = state) do
+    uptime = System.monotonic_time(:millisecond) - connected_at
+
+    if uptime >= @min_stable_ms do
+      %{state | reconnect_idx: 0}
+    else
+      state
     end
   end
 
@@ -212,6 +239,9 @@ defmodule ProjectionUI.HostBridge do
       {to_charlist(key), to_charlist(value)}
     end)
   end
+
+  defp maybe_include_stderr_to_stdout(port_opts, true), do: [:stderr_to_stdout | port_opts]
+  defp maybe_include_stderr_to_stdout(port_opts, _), do: port_opts
 
   defp handle_decode_error(reason, state) do
     {code, message} = decode_error_details(reason)

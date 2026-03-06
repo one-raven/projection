@@ -42,6 +42,8 @@ defmodule Projection.Session do
           router: module() | nil,
           nav: map() | nil,
           app_title: String.t(),
+          app_module: module() | nil,
+          app_state: State.t() | nil,
           screen_params: map(),
           screen_session: map(),
           screen_module: module(),
@@ -92,12 +94,6 @@ defmodule Projection.Session do
     GenServer.call(session, {:ui_envelope_sync, envelope})
   end
 
-  @deprecated "use handle_ui_envelope/2"
-  @spec handle_ui_envelope_async(GenServer.server(), map()) :: :ok
-  def handle_ui_envelope_async(session, envelope) when is_map(envelope) do
-    handle_ui_envelope(session, envelope)
-  end
-
   @doc "Returns the full internal state of the session. Useful for testing and debugging."
   @spec snapshot(GenServer.server()) :: state()
   def snapshot(session), do: GenServer.call(session, :snapshot)
@@ -108,9 +104,12 @@ defmodule Projection.Session do
     screen_session = normalize_screen_session(Keyword.get(opts, :screen_session, %{}))
     app_title = normalize_app_title(Keyword.get(opts, :app_title, "Projection"))
     subscription_hook = normalize_subscription_hook(Keyword.get(opts, :subscription_hook))
+    app_module = resolve_app_module(Keyword.get(opts, :app_module))
 
     {screen_module, screen_params, screen_state, nav} =
       init_screen_context(opts, router, screen_session)
+
+    app_state = mount_app(app_module)
 
     state =
       %{
@@ -128,6 +127,8 @@ defmodule Projection.Session do
         router: router,
         nav: nav,
         app_title: app_title,
+        app_module: app_module,
+        app_state: app_state,
         screen_params: screen_params,
         screen_session: screen_session,
         screen_module: screen_module,
@@ -164,6 +165,7 @@ defmodule Projection.Session do
   def handle_info(:tick, state) do
     put_logger_metadata(state)
     state = %{state | tick_ref: nil}
+    state = dispatch_to_app_state(state, :tick)
     screen_state = dispatch_screen_info(state.screen_module, :tick, state.screen_state)
     next_state = apply_screen_update(state, screen_state, nil)
     put_logger_metadata(next_state)
@@ -184,9 +186,13 @@ defmodule Projection.Session do
   end
 
   @impl true
-  def handle_info(_message, state) do
+  def handle_info(message, state) do
     put_logger_metadata(state)
-    {:noreply, state}
+    state = dispatch_to_app_state(state, message)
+    screen_state = dispatch_screen_info(state.screen_module, message, state.screen_state)
+    next_state = apply_screen_update(state, screen_state, nil)
+    put_logger_metadata(next_state)
+    {:noreply, next_state}
   end
 
   @impl true
@@ -375,6 +381,42 @@ defmodule Projection.Session do
     end
   end
 
+  defp resolve_app_module(nil) do
+    Application.get_env(:projection, :app_module)
+  end
+
+  defp resolve_app_module(module) when is_atom(module), do: module
+
+  defp mount_app(nil), do: nil
+
+  defp mount_app(app_module) do
+    initial_state = State.new(app_module.schema())
+
+    case app_module.mount(initial_state) do
+      {:ok, %State{} = state} ->
+        State.clear_changed(state)
+
+      other ->
+        raise "invalid mount response from app state #{inspect(app_module)}: #{inspect(other)}"
+    end
+  end
+
+  defp dispatch_to_app_state(%{app_module: nil} = state, _message), do: state
+
+  defp dispatch_to_app_state(%{app_module: mod, app_state: app_state} = state, message) do
+    case mod.handle_info(message, app_state) do
+      {:noreply, %State{} = next} ->
+        %{state | app_state: State.clear_changed(next)}
+
+      other ->
+        Logger.warning(
+          "invalid handle_info response from app state #{inspect(mod)}: #{inspect(other)}"
+        )
+
+        state
+    end
+  end
+
   defp dispatch_screen_event(screen_module, event, payload, %State{} = state) do
     if function_exported?(screen_module, :handle_event, 3) do
       case screen_module.handle_event(event, payload, state) do
@@ -459,7 +501,7 @@ defmodule Projection.Session do
         {:ok, screen_vm} ->
           {:ok,
            %{
-             app: %{title: state.app_title},
+             app: build_app_vm(state),
              nav: state.router.to_vm(state.nav),
              screen: %{
                name: current.name,
@@ -527,6 +569,21 @@ defmodule Projection.Session do
     end
   end
 
+  defp build_app_vm(%{app_module: nil} = state), do: %{title: state.app_title}
+
+  defp build_app_vm(%{app_module: mod, app_state: %State{assigns: assigns}} = state) do
+    defaults = mod.schema()
+
+    app_assigns =
+      if map_size(defaults) == 0 do
+        assigns
+      else
+        Map.merge(defaults, Map.take(assigns, Map.keys(defaults)))
+      end
+
+    Map.merge(%{title: state.app_title}, app_assigns)
+  end
+
   defp render_error_vm(state, error_vm) do
     nav_vm =
       if state.router && state.nav do
@@ -536,7 +593,7 @@ defmodule Projection.Session do
       end
 
     %{
-      app: %{title: state.app_title},
+      app: build_app_vm(state),
       nav: nav_vm,
       screen: %{
         name: "error",
