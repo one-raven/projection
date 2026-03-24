@@ -78,51 +78,47 @@ defp deps do
 end
 ```
 
-## Starter generator
+## New project setup
 
-This repo also includes a companion Mix archive project at `projection_new/`.
-It generates a ready-to-run Projection + Slint starter app (router, hello screen,
-UI templates, and a thin `ui_host` adapter crate).
+Setup is a few files. The examples below use `my_app` / `MyApp` — substitute your own names.
 
-The generated app does not copy large host runtime files into your project.
-The generated app references the shared Rust runtime crate directly from
-`deps/projection/slint/ui_host_runtime`.
+### 1. Mix project
 
-Requirement: use Projection from the default Mix deps location (`deps/projection`).
-
-Build and install the archive locally:
-
-```bash
-cd projection_new
-mix archive.build
-mix archive.install
-```
-
-Generate a new app:
-
-```bash
-mix projection.new my_app
-```
-
-## Application setup
-
-Projection codegen and ui_host build should run in your app project, not inside dependency compile steps.
-
-In your app `mix.exs`, opt in to Projection compilers:
+Create `mix.exs` with the Projection compilers:
 
 ```elixir
-def project do
-  [
-    app: :my_app,
-    version: "0.1.0",
-    elixir: "~> 1.19",
-    compilers: Mix.compilers() ++ [:projection_codegen, :projection_ui_host],
-    deps: deps()
-  ]
+defmodule MyApp.MixProject do
+  use Mix.Project
+
+  def project do
+    [
+      app: :my_app,
+      version: "0.1.0",
+      elixir: "~> 1.19",
+      start_permanent: Mix.env() == :prod,
+      compilers: Mix.compilers() ++ [:projection_codegen, :projection_ui_host],
+      deps: deps()
+    ]
+  end
+
+  def application do
+    [
+      extra_applications: [:logger],
+      mod: {MyApp.Application, []}
+    ]
+  end
+
+  defp deps do
+    [
+      {:projection, "~> 0.1.0"}
+    ]
+  end
 end
 ```
 
-In your app config:
+### 2. Config
+
+Create `config/config.exs`:
 
 ```elixir
 import Config
@@ -130,22 +126,318 @@ import Config
 config :projection,
   otp_app: :my_app,
   router_module: MyApp.Router
+
+config :logger, :default_formatter, metadata: [:sid, :rev, :screen]
 ```
 
-Optional:
+Optional config keys:
 
-- `otp_apps: [:my_app, :my_app_web]` for multi-app module discovery.
-- `screen_modules: [MyApp.Screens.Clock]` for explicit extra screen discovery.
-- `ui_root: "lib/my_app/ui"` to override where Slint shell/screen files live. Default is `lib/<otp_app>/ui`.
+- `otp_apps: [:my_app, :my_app_web]` — multi-app module discovery
+- `screen_modules: [MyApp.Screens.Hello]` — explicit extra screen discovery
+- `ui_root: "lib/my_app/ui"` — override Slint shell location (default: `lib/<otp_app>/ui`)
 
-Your app also owns the shared Slint shell files under `lib/<otp_app>/ui/`:
+### 3. Router and screen
 
-- `app_shell.slint`
-- `ui.slint`
-- `screen.slint`
-- `error.slint`
+```elixir
+# lib/my_app/router.ex
+defmodule MyApp.Router do
+  use Projection.Router.DSL
 
-`mix projection.new` scaffolds these for you.
+  screen_session :main do
+    screen "/hello", MyApp.Screens.Hello, :show, as: :hello
+  end
+end
+```
+
+```elixir
+# lib/my_app/screens/hello.ex
+defmodule MyApp.Screens.Hello do
+  use ProjectionUI, :screen
+
+  schema do
+    field :title, :string, default: "Hello Projection"
+    field :subtitle, :string, default: "Elixir owns state. Slint renders it."
+    field :message, :string, default: "Press the button to send an intent."
+    field :click_count, :integer, default: 0
+  end
+
+  @impl true
+  def handle_event("hello.click", _payload, state) do
+    next_count = Map.get(state.assigns, :click_count, 0) + 1
+
+    {:noreply,
+     state
+     |> assign(:click_count, next_count)
+     |> assign(:message, "Hello from Elixir (click #{next_count})")}
+  end
+
+  def handle_event(_event, _payload, state), do: {:noreply, state}
+end
+```
+
+### 4. Slint shell files
+
+Create these four files under `lib/my_app/ui/`. Codegen requires them.
+
+`lib/my_app/ui/ui.slint`:
+
+```slint
+export global UI {
+    callback intent(intent_name: string, intent_arg: string);
+}
+```
+
+`lib/my_app/ui/screen.slint`:
+
+```slint
+import { UI } from "ui.slint";
+
+export component Screen inherits VerticalLayout {
+    callback intent(intent_name: string, intent_arg: string);
+    intent(intent_name, intent_arg) => {
+        UI.intent(intent_name, intent_arg);
+    }
+}
+```
+
+`lib/my_app/ui/error.slint`:
+
+```slint
+import { Screen } from "screen.slint";
+
+export component ErrorScreen inherits Screen {
+    in property <string> title: "Rendering Error";
+    in property <string> message: "";
+    in property <string> screen_module: "";
+
+    spacing: 12px;
+    padding: 8px;
+
+    Text {
+        text: root.title;
+        font-size: 16px;
+        font-weight: 600;
+        color: #cc4444;
+    }
+
+    Text {
+        text: root.message;
+        wrap: word-wrap;
+        font-size: 13px;
+        color: #c0c0d0;
+    }
+
+    Text {
+        text: "Module: " + root.screen_module;
+        font-size: 11px;
+        color: #666688;
+    }
+}
+```
+
+`lib/my_app/ui/app_shell.slint`:
+
+```slint
+export component AppShell inherits Rectangle {
+    in property <string> app_title: "Projection";
+    in property <string> active_tab: "";
+    in property <bool> show_back: false;
+    in property <length> window_width: 480px;
+    in property <length> window_height: 320px;
+
+    callback nav_back();
+    callback navigate(route_name: string);
+
+    background: #1a1a2e;
+
+    VerticalLayout {
+        padding: 16px;
+        spacing: 0px;
+
+        HorizontalLayout {
+            height: 36px;
+            spacing: 12px;
+
+            if root.show_back: Rectangle {
+                width: 60px;
+                height: 32px;
+                border-radius: 6px;
+                background: back_touch.has-hover ? #2a2a4a : #232342;
+
+                Text {
+                    text: "\u{2190} Back";
+                    font-size: 13px;
+                    color: #8888bb;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+
+                back_touch := TouchArea {
+                    clicked => { root.nav_back(); }
+                }
+            }
+
+            Text {
+                text: root.app_title;
+                font-size: 18px;
+                font-weight: 600;
+                color: #e0e0f0;
+                vertical-alignment: center;
+            }
+        }
+
+        Rectangle {
+            height: 1px;
+            background: #2a2a4a;
+        }
+
+        VerticalLayout {
+            padding-top: 12px;
+            @children
+        }
+    }
+}
+```
+
+### 5. Screen Slint file
+
+Each screen needs a matching `.slint` file. For the hello screen above:
+
+`lib/my_app/ui/hello.slint`:
+
+```slint
+import { Screen } from "screen.slint";
+
+export component HelloScreen inherits Screen {
+    in property <string> title: "Hello Projection";
+    in property <string> subtitle: "Elixir owns state. Slint renders it.";
+    in property <string> message: "Press the button to send an intent.";
+    in property <int> click_count: 0;
+
+    spacing: 12px;
+    padding: 12px;
+
+    Text {
+        text: root.title;
+        font-size: 22px;
+        font-weight: 700;
+        color: #f2f2ff;
+    }
+
+    Text {
+        text: root.subtitle;
+        wrap: word-wrap;
+        color: #b8b8d0;
+        font-size: 13px;
+    }
+
+    Rectangle { height: 1px; background: #2a2a4a; }
+
+    Text {
+        text: root.message;
+        wrap: word-wrap;
+        color: #d8d8f0;
+        font-size: 15px;
+    }
+
+    Rectangle {
+        height: 34px;
+        border-radius: 6px;
+        background: touch.has-hover ? #2a2a4a : #232342;
+
+        Text {
+            text: "Say Hello";
+            horizontal-alignment: center;
+            vertical-alignment: center;
+            color: #cfcfe7;
+            font-size: 13px;
+            font-weight: 600;
+        }
+
+        touch := TouchArea {
+            clicked => { root.intent("hello.click", ""); }
+        }
+    }
+}
+```
+
+### 6. Rust UI host
+
+Create a thin Rust adapter crate at `slint/ui_host/`. This references Projection's shared runtime from `deps/`.
+
+`slint/ui_host/Cargo.toml`:
+
+```toml
+[package]
+name = "ui_host"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+projection_ui_host_runtime = { path = "../../deps/projection/slint/ui_host_runtime" }
+serde_json = "1.0.149"
+slint = { version = "=1.15.0", default-features = false, features = ["std", "backend-winit", "renderer-software", "compat-1-2"] }
+
+[build-dependencies]
+slint-build = "=1.15.0"
+```
+
+`slint/ui_host/src/main.rs`:
+
+```rust
+mod generated;
+
+slint::include_modules!();
+
+projection_ui_host_runtime::app_main!(AppWindow, UI, ErrorState, generated);
+```
+
+Create the generated output directory:
+
+```bash
+mkdir -p slint/ui_host/src/generated
+touch slint/ui_host/src/generated/.gitkeep
+```
+
+### 7. Build and run
+
+```bash
+mix deps.get
+mix compile      # runs codegen + builds the Rust ui_host
+```
+
+To launch for development, create a small entry point:
+
+```elixir
+# lib/my_app/demo.ex
+defmodule MyApp.Demo do
+  def run do
+    suffix = if match?({:win32, _}, :os.type()), do: ".exe", else: ""
+
+    command =
+      :my_app
+      |> :code.priv_dir()
+      |> to_string()
+      |> Path.join("ui_host/ui_host" <> suffix)
+
+    {:ok, _supervisor} =
+      Projection.start_session(
+        name: MyApp.ProjectionSupervisor,
+        session_name: MyApp.ProjectionSession,
+        host_bridge_name: MyApp.ProjectionHostBridge,
+        router: MyApp.Router,
+        route: "hello",
+        command: command
+      )
+
+    Process.sleep(:infinity)
+  end
+end
+```
+
+```bash
+mix run -e "MyApp.Demo.run()"
+```
 
 ## LiveView-style structure
 

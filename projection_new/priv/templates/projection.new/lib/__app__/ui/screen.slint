@@ -1,8 +1,0 @@
-import { UI } from "ui.slint";
-
-export component Screen inherits VerticalLayout {
-    callback intent(intent_name: string, intent_arg: string);
-    intent(intent_name, intent_arg) => {
-        UI.intent(intent_name, intent_arg);
-    }
-}

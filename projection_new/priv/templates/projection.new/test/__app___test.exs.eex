@@ -1,7 +1,0 @@
-defmodule <%= module %>Test do
-  use ExUnit.Case, async: true
-
-  test "app module exists" do
-    assert Code.ensure_loaded?(<%= module %>)
-  end
-end

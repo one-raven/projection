@@ -1,7 +1,0 @@
-import Config
-
-config :projection,
-  otp_app: :<%= app %>,
-  router_module: <%= module %>.Router
-
-config :logger, :default_formatter, metadata: [:sid, :rev, :screen]

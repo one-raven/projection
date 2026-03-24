@@ -27,6 +27,12 @@ defmodule Mix.Tasks.Projection.Codegen do
       |> Enum.map(&build_screen_spec/1)
       |> Enum.sort_by(& &1.module_name)
 
+    Enum.each(specs, fn spec ->
+      if function_exported?(spec.module, :render, 1) do
+        ProjectionUI.Schema.validate_render!(spec.module)
+      end
+    end)
+
     app_module = discover_app_module()
     app_spec = if app_module, do: build_app_state_spec(app_module), else: nil
 
@@ -40,27 +46,27 @@ defmodule Mix.Tasks.Projection.Codegen do
       specs
       |> Task.async_stream(
         fn spec ->
-          path = Path.join(generated_dir, "#{spec.file_name}.rs")
-          write_file_if_changed(path, render_screen_module(spec))
+          rs =
+            write_file_if_changed(
+              Path.join(generated_dir, "#{spec.file_name}.rs"),
+              render_screen_module(spec)
+            )
+
+          slint =
+            write_file_if_changed(
+              Path.join(generated_dir, spec.state_file),
+              render_screen_state_slint(spec)
+            )
+
+          {rs, slint}
         end,
         ordered: false,
-        timeout: :infinity,
+        timeout: codegen_task_timeout(),
         max_concurrency: max_concurrency()
       )
       |> Enum.map(&unwrap_task_result!/1)
 
-    screen_state_results =
-      specs
-      |> Task.async_stream(
-        fn spec ->
-          path = Path.join(generated_dir, spec.state_file)
-          write_file_if_changed(path, render_screen_state_slint(spec))
-        end,
-        ordered: false,
-        timeout: :infinity,
-        max_concurrency: max_concurrency()
-      )
-      |> Enum.map(&unwrap_task_result!/1)
+    {screen_rs_results, screen_slint_results} = Enum.unzip(screen_results)
 
     app_state_results =
       if app_spec do
@@ -115,8 +121,8 @@ defmodule Mix.Tasks.Projection.Codegen do
 
     written_count =
       Enum.count(
-        screen_results ++
-          screen_state_results ++
+        screen_rs_results ++
+          screen_slint_results ++
           app_state_results ++
           [
             mod_result,
@@ -249,6 +255,8 @@ defmodule Mix.Tasks.Projection.Codegen do
     end
   end
 
+  @supported_app_state_types [:string, :bool, :integer, :float, :list]
+
   defp build_app_state_spec(module) do
     metadata = module.__projection_schema__()
 
@@ -256,6 +264,19 @@ defmodule Mix.Tasks.Projection.Codegen do
       metadata
       |> Enum.map(&normalize_field!/1)
       |> Enum.sort_by(&Atom.to_string(&1.name))
+
+    unsupported_app_fields =
+      Enum.reject(fields, &(&1.type in @supported_app_state_types))
+
+    if unsupported_app_fields != [] do
+      descriptions =
+        Enum.map_join(unsupported_app_fields, ", ", &"#{&1.name}: #{inspect(&1.type)}")
+
+      Mix.raise(
+        "projection.codegen does not support #{descriptions} in app_state module #{inspect(module)}. " <>
+          "App state only supports direct scalar and list fields."
+      )
+    end
 
     codegen_fields =
       fields
@@ -315,7 +336,7 @@ defmodule Mix.Tasks.Projection.Codegen do
       Missing:
       #{Enum.map_join(missing, "\n", &"  - #{&1}")}
 
-      You can scaffold these with `mix projection.new` or add them manually.
+      See the "Slint shell files" section in the README for starter templates.
       """)
     end
   end
@@ -624,8 +645,24 @@ defmodule Mix.Tasks.Projection.Codegen do
 
   defp unwrap_task_result!({:ok, status}), do: status
 
+  defp unwrap_task_result!({:exit, :timeout}) do
+    Mix.raise(
+      "projection.codegen worker timed out after #{codegen_task_timeout()}ms. " <>
+        "A render function may be hanging. Set PROJECTION_CODEGEN_TIMEOUT=<ms> to adjust."
+    )
+  end
+
   defp unwrap_task_result!({:exit, reason}) do
     Mix.raise("projection.codegen worker crashed: #{inspect(reason)}")
+  end
+
+  @codegen_task_timeout_default 30_000
+
+  defp codegen_task_timeout do
+    case System.get_env("PROJECTION_CODEGEN_TIMEOUT") do
+      nil -> @codegen_task_timeout_default
+      value -> String.to_integer(value)
+    end
   end
 
   defp max_concurrency do
@@ -760,6 +797,7 @@ defmodule Mix.Tasks.Projection.Codegen do
     fn screen_id_from_vm(vm: &Value) -> ScreenId {
         match vm.pointer("/screen/name").and_then(Value::as_str) {
     #{enum_from_vm_arms}
+            // Fallthrough: unknown screen names map to the first screen as a safe default.
             _ => ScreenId::#{camelize(first.screen_name)},
         }
     }

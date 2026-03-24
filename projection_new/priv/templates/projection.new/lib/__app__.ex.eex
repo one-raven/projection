@@ -1,5 +1,0 @@
-defmodule <%= module %> do
-  @moduledoc """
-  <%= module %> application root module.
-  """
-end
