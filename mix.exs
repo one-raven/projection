@@ -7,7 +7,7 @@ defmodule Projection.MixProject do
       version: "0.1.0",
       elixir: "~> 1.19",
       start_permanent: Mix.env() == :prod,
-      compilers: Mix.compilers() ++ [:projection_ui_host],
+      compilers: Mix.compilers(),
       deps: deps(),
       description: "Elixir-authoritative UI for native and embedded apps, rendered by Slint.",
       source_url: "https://github.com/isaiahp/projection",
@@ -36,11 +36,8 @@ defmodule Projection.MixProject do
       links: %{"GitHub" => "https://github.com/isaiahp/projection"},
       files: ~w(
         lib
-        slint/ui_host/Cargo.toml
-        slint/ui_host/build.rs
-        slint/ui_host/.gitignore
-        slint/ui_host/src/main.rs
         slint/ui_host_runtime/Cargo.toml
+        slint/ui_host_runtime/Cargo.lock
         slint/ui_host_runtime/src/lib.rs
         slint/ui_host_runtime/src/protocol.rs
         mix.exs
