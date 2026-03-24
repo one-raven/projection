@@ -48,6 +48,7 @@ defmodule Projection.Session do
           screen_session: map(),
           screen_module: module(),
           screen_state: State.t(),
+          live_components: %{atom() => %{module: module(), state: State.t()}},
           subscriptions: MapSet.t(term()),
           subscription_hook: (atom(), term() -> any())
         }
@@ -106,10 +107,15 @@ defmodule Projection.Session do
     subscription_hook = normalize_subscription_hook(Keyword.get(opts, :subscription_hook))
     app_module = resolve_app_module(Keyword.get(opts, :app_module))
 
+    {:ok, task_supervisor} = Task.Supervisor.start_link([])
+
     {screen_module, screen_params, screen_state, nav} =
       init_screen_context(opts, router, screen_session)
 
     app_state = mount_app(app_module)
+    screen_derived_lookup = build_derived_lookup(screen_module)
+    screen_state = recompute_derived_fields(screen_state, screen_derived_lookup)
+    live_components = mount_live_components(screen_module, screen_state)
 
     state =
       %{
@@ -133,8 +139,12 @@ defmodule Projection.Session do
         screen_session: screen_session,
         screen_module: screen_module,
         screen_state: screen_state,
+        screen_derived_lookup: screen_derived_lookup,
+        live_components: live_components,
         subscriptions: MapSet.new(),
-        subscription_hook: subscription_hook
+        subscription_hook: subscription_hook,
+        task_supervisor: task_supervisor,
+        async_tasks: %{}
       }
       |> sync_subscriptions()
 
@@ -166,8 +176,9 @@ defmodule Projection.Session do
     put_logger_metadata(state)
     state = %{state | tick_ref: nil}
     state = dispatch_to_app_state(state, :tick)
-    screen_state = dispatch_screen_info(state.screen_module, :tick, state.screen_state)
+    {screen_state, effects} = dispatch_screen_info(state.screen_module, :tick, state.screen_state)
     next_state = apply_screen_update(state, screen_state, nil)
+    next_state = execute_effects(effects, next_state, :screen)
     put_logger_metadata(next_state)
     {:noreply, maybe_schedule_tick(next_state)}
   end
@@ -185,12 +196,72 @@ defmodule Projection.Session do
     {:noreply, state}
   end
 
+  def handle_info({ref, result}, state) when is_reference(ref) do
+    case find_async_task_by_ref(state.async_tasks, ref) do
+      {{scope, key} = task_key, _task_info} ->
+        put_logger_metadata(state)
+        Process.demonitor(ref, [:flush])
+        next_state = %{state | async_tasks: Map.delete(state.async_tasks, task_key)}
+
+        next_state =
+          apply_async_result(next_state, scope, key, ProjectionUI.AsyncResult.ok(result))
+
+        put_logger_metadata(next_state)
+        {:noreply, next_state}
+
+      nil ->
+        # Not one of our async tasks, forward to screen
+        put_logger_metadata(state)
+        state = dispatch_to_app_state(state, {ref, result})
+
+        {screen_state, effects} =
+          dispatch_screen_info(state.screen_module, {ref, result}, state.screen_state)
+
+        next_state = apply_screen_update(state, screen_state, nil)
+        next_state = execute_effects(effects, next_state, :screen)
+        put_logger_metadata(next_state)
+        {:noreply, next_state}
+    end
+  end
+
+  def handle_info({:DOWN, ref, :process, _pid, reason} = down_msg, state)
+      when is_reference(ref) do
+    case find_async_task_by_ref(state.async_tasks, ref) do
+      {{scope, key} = task_key, _task_info} ->
+        put_logger_metadata(state)
+        next_state = %{state | async_tasks: Map.delete(state.async_tasks, task_key)}
+
+        next_state =
+          apply_async_result(next_state, scope, key, ProjectionUI.AsyncResult.failed(reason))
+
+        put_logger_metadata(next_state)
+        {:noreply, next_state}
+
+      nil ->
+        # Not one of our async tasks, forward to screen
+        put_logger_metadata(state)
+        state = dispatch_to_app_state(state, down_msg)
+
+        {screen_state, effects} =
+          dispatch_screen_info(state.screen_module, down_msg, state.screen_state)
+
+        next_state = apply_screen_update(state, screen_state, nil)
+        next_state = execute_effects(effects, next_state, :screen)
+        put_logger_metadata(next_state)
+        {:noreply, next_state}
+    end
+  end
+
   @impl true
   def handle_info(message, state) do
     put_logger_metadata(state)
     state = dispatch_to_app_state(state, message)
-    screen_state = dispatch_screen_info(state.screen_module, message, state.screen_state)
+
+    {screen_state, effects} =
+      dispatch_screen_info(state.screen_module, message, state.screen_state)
+
     next_state = apply_screen_update(state, screen_state, nil)
+    next_state = execute_effects(effects, next_state, :screen)
     put_logger_metadata(next_state)
     {:noreply, next_state}
   end
@@ -199,6 +270,8 @@ defmodule Projection.Session do
   def terminate(_reason, state) do
     put_logger_metadata(state)
     cancel_patch_flush_timer(state.patch_flush_ref)
+    cancel_all_async_tasks(state)
+    terminate_screen_and_components(state, :shutdown)
 
     state
     |> Map.get(:subscriptions, MapSet.new())
@@ -230,11 +303,18 @@ defmodule Projection.Session do
             {:ok, [], next_state}
 
           :unhandled ->
-            screen_state =
-              dispatch_screen_event(state.screen_module, name, payload, state.screen_state)
+            case maybe_route_component_event(name, payload, ack, state) do
+              {:handled, next_state} ->
+                {:ok, [], next_state}
 
-            next_state = apply_screen_update(state, screen_state, ack)
-            {:ok, [], next_state}
+              :unhandled ->
+                {screen_state, effects} =
+                  dispatch_screen_event(state.screen_module, name, payload, state.screen_state)
+
+                next_state = apply_screen_update(state, screen_state, ack)
+                next_state = execute_effects(effects, next_state, :screen)
+                {:ok, [], next_state}
+            end
         end
 
       _ ->
@@ -267,13 +347,20 @@ defmodule Projection.Session do
          {:ok, false} <- state.router.screen_session_transition?(state.nav, to_name),
          {:ok, nav} <- state.router.navigate(state.nav, to_name, params),
          {:ok, route_def} <- state.router.current_route(nav) do
+      terminate_screen_and_components(state, :navigate)
+      state = cancel_all_async_tasks(state)
+      screen_derived_lookup = build_derived_lookup(route_def.screen_module)
       screen_state = mount_screen!(route_def.screen_module, params, state.screen_session)
+      screen_state = recompute_derived_fields(screen_state, screen_derived_lookup)
+      live_components = mount_live_components(route_def.screen_module, screen_state)
 
       state
       |> Map.merge(%{
         nav: nav,
         screen_module: route_def.screen_module,
-        screen_params: params
+        screen_params: params,
+        screen_derived_lookup: screen_derived_lookup,
+        live_components: live_components
       })
       |> tap(fn _ ->
         Logger.info("screen transition navigate from=#{from_screen} to=#{to_name}")
@@ -296,7 +383,7 @@ defmodule Projection.Session do
     current = state.router.current(nav)
 
     with {:ok, route_def} <- state.router.current_route(nav) do
-      screen_state =
+      {screen_state, effects} =
         dispatch_screen_params(
           route_def.screen_module,
           current.params,
@@ -304,14 +391,17 @@ defmodule Projection.Session do
           state.screen_session
         )
 
-      state
-      |> Map.merge(%{
-        nav: nav,
-        screen_module: route_def.screen_module,
-        screen_params: current.params
-      })
-      |> sync_subscriptions()
-      |> apply_screen_update(screen_state, ack)
+      next_state =
+        state
+        |> Map.merge(%{
+          nav: nav,
+          screen_module: route_def.screen_module,
+          screen_params: current.params
+        })
+        |> sync_subscriptions()
+        |> apply_screen_update(screen_state, ack)
+
+      execute_effects(effects, next_state, :screen)
     else
       _ -> state
     end
@@ -322,14 +412,24 @@ defmodule Projection.Session do
 
     with {:ok, nav} <- state.router.back(state.nav),
          {:ok, route_def} <- state.router.current_route(nav) do
+      terminate_screen_and_components(state, :navigate)
+      state = cancel_all_async_tasks(state)
       current = state.router.current(nav)
-      screen_state = mount_screen!(route_def.screen_module, current.params, state.screen_session)
+      screen_derived_lookup = build_derived_lookup(route_def.screen_module)
+
+      screen_state =
+        mount_screen!(route_def.screen_module, current.params, state.screen_session)
+
+      screen_state = recompute_derived_fields(screen_state, screen_derived_lookup)
+      live_components = mount_live_components(route_def.screen_module, screen_state)
 
       state
       |> Map.merge(%{
         nav: nav,
         screen_module: route_def.screen_module,
-        screen_params: current.params
+        screen_params: current.params,
+        screen_derived_lookup: screen_derived_lookup,
+        live_components: live_components
       })
       |> tap(fn _ ->
         Logger.info("screen transition back from=#{from_screen} to=#{current.name}")
@@ -365,8 +465,304 @@ defmodule Projection.Session do
   defp ensure_stable_sid(nil, incoming_sid), do: incoming_sid
   defp ensure_stable_sid(existing_sid, _incoming_sid), do: existing_sid
 
+  # --- Live component helpers ---
+
+  defp mount_live_components(screen_module, screen_state) do
+    if function_exported?(screen_module, :__projection_schema__, 0) do
+      screen_module.__projection_schema__()
+      |> Enum.filter(&(&1.type == :component))
+      |> Enum.reduce(%{}, fn field, acc ->
+        component_module = field |> Map.get(:opts, []) |> Keyword.get(:module)
+
+        if component_module && live_component?(component_module) do
+          comp_derived_names = derived_field_names(component_module)
+          comp_derived_lookup = build_derived_lookup(component_module)
+          component_state = State.new(component_module.schema(), derived: comp_derived_names)
+          initial_assigns = Map.get(screen_state.assigns, field.name, %{})
+
+          component_state =
+            case component_module.mount(initial_assigns, component_state) do
+              {:ok, %State{} = s} -> s
+              _ -> component_state
+            end
+
+          component_state = recompute_derived_fields(component_state, comp_derived_lookup)
+
+          # Call update/2 with initial assigns so the component can derive state
+          component_state =
+            if initial_assigns != %{} do
+              case component_module.update(initial_assigns, component_state) do
+                {:ok, %State{} = s} ->
+                  s |> recompute_derived_fields(comp_derived_lookup) |> State.clear_changed()
+
+                _ ->
+                  State.clear_changed(component_state)
+              end
+            else
+              State.clear_changed(component_state)
+            end
+
+          in_fields = compute_component_in_fields(component_module)
+
+          Map.put(acc, field.name, %{
+            module: component_module,
+            state: component_state,
+            in_fields: in_fields,
+            derived_lookup: comp_derived_lookup
+          })
+        else
+          acc
+        end
+      end)
+    else
+      %{}
+    end
+  end
+
+  defp compute_component_in_fields(component_module) do
+    if function_exported?(component_module, :__projection_schema__, 0) do
+      component_module.__projection_schema__()
+      |> Enum.filter(fn field ->
+        direction = field |> Map.get(:opts, []) |> Keyword.get(:direction, :in)
+        direction in [:in, :in_out]
+      end)
+      |> Enum.map(& &1.name)
+      |> MapSet.new()
+    else
+      MapSet.new()
+    end
+  end
+
+  defp build_derived_lookup(module) do
+    if function_exported?(module, :__projection_schema__, 0) do
+      module.__projection_schema__()
+      |> Enum.filter(fn field ->
+        Map.get(field, :opts, []) |> Keyword.get(:derived, false)
+      end)
+      |> Enum.reduce(%{}, fn field, acc ->
+        opts = Map.get(field, :opts, [])
+        from_field = Keyword.fetch!(opts, :from)
+        with_mfa = Keyword.fetch!(opts, :with)
+        entry = {field.name, with_mfa}
+        Map.update(acc, from_field, [entry], &[entry | &1])
+      end)
+    else
+      %{}
+    end
+  end
+
+  defp recompute_derived_fields(%State{} = state, derived_lookup) when derived_lookup == %{} do
+    state
+  end
+
+  defp recompute_derived_fields(%State{} = state, derived_lookup) do
+    changed = State.changed_fields(state)
+
+    Enum.reduce(changed, state, fn source_field, acc ->
+      case Map.fetch(derived_lookup, source_field) do
+        {:ok, derivations} ->
+          source_value = Map.get(acc.assigns, source_field)
+
+          Enum.reduce(derivations, acc, fn {derived_name, {mod, fun}}, inner_acc ->
+            derived_value = apply(mod, fun, [source_value])
+
+            # Bypass the derived guard by directly updating assigns
+            current = Map.get(inner_acc.assigns, derived_name)
+
+            if current === derived_value do
+              inner_acc
+            else
+              %{
+                inner_acc
+                | assigns: Map.put(inner_acc.assigns, derived_name, derived_value),
+                  changed: MapSet.put(inner_acc.changed, derived_name)
+              }
+            end
+          end)
+
+        :error ->
+          acc
+      end
+    end)
+  end
+
+  defp derived_field_names(module) do
+    if function_exported?(module, :__projection_schema__, 0) do
+      module.__projection_schema__()
+      |> Enum.filter(fn field ->
+        Map.get(field, :opts, []) |> Keyword.get(:derived, false)
+      end)
+      |> Enum.map(& &1.name)
+    else
+      []
+    end
+  end
+
+  defp live_component?(module) when is_atom(module) do
+    function_exported?(module, :__projection_live_component__, 0)
+  end
+
+  defp maybe_route_component_event(name, payload, ack, state) do
+    case split_component_event(name) do
+      {component_name, component_event} ->
+        case Map.fetch(state.live_components, component_name) do
+          {:ok, %{module: mod, state: comp_state}} ->
+            next_state =
+              apply_component_event(
+                state,
+                component_name,
+                mod,
+                comp_state,
+                component_event,
+                payload,
+                ack
+              )
+
+            {:handled, next_state}
+
+          :error ->
+            :unhandled
+        end
+
+      :not_component ->
+        :unhandled
+    end
+  end
+
+  defp split_component_event(name) when is_binary(name) do
+    case String.split(name, ":", parts: 2) do
+      [prefix, event] when prefix != "" and event != "" ->
+        case safe_existing_atom(prefix) do
+          {:ok, atom_key} -> {atom_key, event}
+          :error -> :not_component
+        end
+
+      _ ->
+        :not_component
+    end
+  end
+
+  defp safe_existing_atom(string) when is_binary(string) do
+    {:ok, String.to_existing_atom(string)}
+  rescue
+    ArgumentError -> :error
+  end
+
+  defp apply_component_event(state, component_name, mod, comp_state, event, payload, ack) do
+    comp_entry = Map.fetch!(state.live_components, component_name)
+    comp_derived = Map.get(comp_entry, :derived_lookup, %{})
+
+    {next_comp_state, effects} =
+      case mod.handle_event(event, payload, comp_state) do
+        {:noreply, %State{} = s} ->
+          {recompute_derived_fields(s, comp_derived), []}
+
+        {:noreply, %State{} = s, opts} when is_list(opts) ->
+          {recompute_derived_fields(s, comp_derived), Keyword.get(opts, :effects, [])}
+
+        _ ->
+          {comp_state, []}
+      end
+
+    {state, next_comp_state} =
+      drain_pending_async(state, {:component, component_name}, next_comp_state)
+
+    changed_fields = State.changed_fields(next_comp_state)
+    cleared_comp_state = State.clear_changed(next_comp_state)
+
+    next_live_components =
+      Map.put(state.live_components, component_name, %{comp_entry | state: cleared_comp_state})
+
+    next_state = %{state | live_components: next_live_components}
+
+    # The component name itself is the changed field from the screen VM perspective
+    all_changed_fields = if changed_fields != [], do: [component_name], else: []
+
+    {render_status, next_vm} = render_vm_with_status(next_state)
+
+    ops =
+      case render_status do
+        :ok -> vm_patch_ops(state.vm, next_vm, all_changed_fields, next_state.router)
+        :error -> vm_patch_ops(state.vm, next_vm)
+      end
+
+    next_state = %{next_state | vm: next_vm}
+
+    next_state =
+      case {state.sid, ops} do
+        {_sid, []} -> next_state
+        {nil, _ops} -> next_state
+        {_sid, _ops} -> enqueue_patch_batch(next_state, ops, ack)
+      end
+
+    execute_effects(effects, next_state, {:component, component_name})
+  end
+
+  defp update_live_components_from_screen(live_components, changed_fields, screen_state) do
+    Enum.reduce(changed_fields, {live_components, []}, fn field, {lc, extra_changed} ->
+      case Map.fetch(lc, field) do
+        {:ok,
+         %{module: mod, state: comp_state, in_fields: in_fields, derived_lookup: comp_derived} =
+             comp_entry} ->
+          raw_assigns = Map.get(screen_state.assigns, field, %{})
+
+          new_assigns =
+            if MapSet.size(in_fields) > 0 do
+              Map.filter(raw_assigns, fn {k, _v} -> MapSet.member?(in_fields, k) end)
+            else
+              raw_assigns
+            end
+
+          next_comp_state =
+            case mod.update(new_assigns, comp_state) do
+              {:ok, %State{} = s} ->
+                s |> recompute_derived_fields(comp_derived) |> State.clear_changed()
+
+              _ ->
+                comp_state
+            end
+
+          updated_lc = Map.put(lc, field, %{comp_entry | state: next_comp_state})
+          {updated_lc, [field | extra_changed]}
+
+        :error ->
+          {lc, extra_changed}
+      end
+    end)
+  end
+
+  defp compose_live_component_renders(screen_vm, live_components) when live_components == %{} do
+    screen_vm
+  end
+
+  defp compose_live_component_renders(screen_vm, live_components) do
+    Enum.reduce(live_components, screen_vm, fn {component_name, %{module: mod, state: comp_state}},
+                                               vm ->
+      try do
+        component_vm = mod.render(comp_state.assigns)
+
+        if is_map(component_vm) do
+          Map.put(vm, component_name, component_vm)
+        else
+          vm
+        end
+      rescue
+        exception ->
+          Logger.error(
+            "live component render failed for #{inspect(mod)}\n" <>
+              Exception.format(:error, exception, __STACKTRACE__)
+          )
+
+          vm
+      end
+    end)
+  end
+
+  # --- End live component helpers ---
+
   defp mount_screen!(screen_module, params, session) do
-    initial_state = State.new(screen_module.schema())
+    derived_names = derived_field_names(screen_module)
+    initial_state = State.new(screen_module.schema(), derived: derived_names)
 
     if function_exported?(screen_module, :mount, 3) do
       case screen_module.mount(params, session, initial_state) do
@@ -421,17 +817,20 @@ defmodule Projection.Session do
     if function_exported?(screen_module, :handle_event, 3) do
       case screen_module.handle_event(event, payload, state) do
         {:noreply, %State{} = next_state} ->
-          next_state
+          {next_state, []}
+
+        {:noreply, %State{} = next_state, opts} when is_list(opts) ->
+          {next_state, Keyword.get(opts, :effects, [])}
 
         other ->
           Logger.warning(
             "invalid handle_event response from #{inspect(screen_module)}: #{inspect(other)}"
           )
 
-          state
+          {state, []}
       end
     else
-      state
+      {state, []}
     end
   end
 
@@ -439,17 +838,20 @@ defmodule Projection.Session do
     if function_exported?(screen_module, :handle_params, 2) do
       case screen_module.handle_params(params, state) do
         {:noreply, %State{} = next_state} ->
-          next_state
+          {next_state, []}
+
+        {:noreply, %State{} = next_state, opts} when is_list(opts) ->
+          {next_state, Keyword.get(opts, :effects, [])}
 
         other ->
           Logger.warning(
             "invalid handle_params response from #{inspect(screen_module)}: #{inspect(other)}"
           )
 
-          state
+          {state, []}
       end
     else
-      mount_screen!(screen_module, params, session)
+      {mount_screen!(screen_module, params, session), []}
     end
   end
 
@@ -457,17 +859,20 @@ defmodule Projection.Session do
     if function_exported?(screen_module, :handle_info, 2) do
       case screen_module.handle_info(message, state) do
         {:noreply, %State{} = next_state} ->
-          next_state
+          {next_state, []}
+
+        {:noreply, %State{} = next_state, opts} when is_list(opts) ->
+          {next_state, Keyword.get(opts, :effects, [])}
 
         other ->
           Logger.warning(
             "invalid handle_info response from #{inspect(screen_module)}: #{inspect(other)}"
           )
 
-          state
+          {state, []}
       end
     else
-      state
+      {state, []}
     end
   end
 
@@ -482,7 +887,7 @@ defmodule Projection.Session do
     result =
       case safe_render_screen(state.screen_module, state.screen_state.assigns, state) do
         {:ok, vm} ->
-          {:ok, vm}
+          {:ok, compose_live_component_renders(vm, state.live_components)}
 
         {:error, error_vm} ->
           {:error, render_error_vm(state, error_vm)}
@@ -499,6 +904,8 @@ defmodule Projection.Session do
     result =
       case safe_render_screen(state.screen_module, state.screen_state.assigns, state) do
         {:ok, screen_vm} ->
+          composed_vm = compose_live_component_renders(screen_vm, state.live_components)
+
           {:ok,
            %{
              app: build_app_vm(state),
@@ -506,7 +913,7 @@ defmodule Projection.Session do
              screen: %{
                name: current.name,
                action: current.action,
-               vm: screen_vm
+               vm: composed_vm
              }
            }}
 
@@ -604,13 +1011,29 @@ defmodule Projection.Session do
   end
 
   defp apply_screen_update(state, %State{} = screen_state, ack) do
+    screen_state = recompute_derived_fields(screen_state, state.screen_derived_lookup)
+    {state, screen_state} = drain_pending_async(state, :screen, screen_state)
     changed_fields = State.changed_fields(screen_state)
     next_state = %{state | screen_state: State.clear_changed(screen_state)}
+
+    # Check if any changed fields correspond to live components and call update/2
+    {next_live_components, component_changed_fields} =
+      update_live_components_from_screen(
+        next_state.live_components,
+        changed_fields,
+        next_state.screen_state
+      )
+
+    next_state = %{next_state | live_components: next_live_components}
+
+    # Merge component changed fields so the differ targets component VM paths
+    all_changed_fields = Enum.uniq(changed_fields ++ component_changed_fields)
+
     {render_status, next_vm} = render_vm_with_status(next_state)
 
     ops =
       case render_status do
-        :ok -> vm_patch_ops(state.vm, next_vm, changed_fields, next_state.router)
+        :ok -> vm_patch_ops(state.vm, next_vm, all_changed_fields, next_state.router)
         :error -> vm_patch_ops(state.vm, next_vm)
       end
 
@@ -1011,6 +1434,170 @@ defmodule Projection.Session do
       %{count: 1, duration_native: duration_native},
       telemetry_metadata(state, %{status: status})
     )
+  end
+
+  # --- Async task helpers ---
+
+  defp drain_pending_async(session_state, _scope, %State{pending_async: []} = returned_state) do
+    {session_state, returned_state}
+  end
+
+  defp drain_pending_async(session_state, scope, %State{pending_async: pending} = returned_state) do
+    next_session_state =
+      Enum.reduce(Enum.reverse(pending), session_state, fn {key, fun}, sess ->
+        start_async_task(sess, scope, key, fun)
+      end)
+
+    {next_session_state, %{returned_state | pending_async: []}}
+  end
+
+  defp start_async_task(session_state, scope, key, fun) do
+    # Cancel any existing task for this scope+key
+    session_state = cancel_async_task(session_state, scope, key)
+
+    task =
+      Task.Supervisor.async_nolink(session_state.task_supervisor, fun)
+
+    async_tasks =
+      Map.put(session_state.async_tasks, {scope, key}, %{ref: task.ref, pid: task.pid})
+
+    %{session_state | async_tasks: async_tasks}
+  end
+
+  defp cancel_async_task(session_state, scope, key) do
+    task_key = {scope, key}
+
+    case Map.fetch(session_state.async_tasks, task_key) do
+      {:ok, %{ref: ref, pid: pid}} ->
+        Process.demonitor(ref, [:flush])
+        Process.exit(pid, :kill)
+        %{session_state | async_tasks: Map.delete(session_state.async_tasks, task_key)}
+
+      :error ->
+        session_state
+    end
+  end
+
+  defp cancel_all_async_tasks(session_state) do
+    Enum.reduce(session_state.async_tasks, session_state, fn {{scope, key}, _task_info}, sess ->
+      cancel_async_task(sess, scope, key)
+    end)
+  end
+
+  defp find_async_task_by_ref(async_tasks, ref) do
+    Enum.find(async_tasks, fn {_key, %{ref: task_ref}} -> task_ref == ref end)
+  end
+
+  defp apply_async_result(session_state, scope, key, async_result) do
+    case scope do
+      :screen ->
+        screen_state = session_state.screen_state
+
+        next_screen_state = %{
+          screen_state
+          | assigns: Map.put(screen_state.assigns, key, async_result),
+            changed: MapSet.put(screen_state.changed, key)
+        }
+
+        next_session_state = %{session_state | screen_state: next_screen_state}
+        apply_screen_update(next_session_state, next_screen_state, nil)
+
+      {:component, component_name} ->
+        case Map.fetch(session_state.live_components, component_name) do
+          {:ok, comp_entry} ->
+            comp_state = comp_entry.state
+
+            next_comp_state = %{
+              comp_state
+              | assigns: Map.put(comp_state.assigns, key, async_result),
+                changed: MapSet.put(comp_state.changed, key)
+            }
+
+            comp_derived = Map.get(comp_entry, :derived_lookup, %{})
+            next_comp_state = recompute_derived_fields(next_comp_state, comp_derived)
+            changed_fields = State.changed_fields(next_comp_state)
+            cleared = State.clear_changed(next_comp_state)
+
+            next_live_components =
+              Map.put(session_state.live_components, component_name, %{
+                comp_entry
+                | state: cleared
+              })
+
+            next_session_state = %{session_state | live_components: next_live_components}
+
+            all_changed_fields = if changed_fields != [], do: [component_name], else: []
+
+            {render_status, next_vm} = render_vm_with_status(next_session_state)
+
+            ops =
+              case render_status do
+                :ok ->
+                  vm_patch_ops(
+                    session_state.vm,
+                    next_vm,
+                    all_changed_fields,
+                    next_session_state.router
+                  )
+
+                :error ->
+                  vm_patch_ops(session_state.vm, next_vm)
+              end
+
+            next_session_state = %{next_session_state | vm: next_vm}
+
+            case {session_state.sid, ops} do
+              {_sid, []} -> next_session_state
+              {nil, _ops} -> next_session_state
+              {_sid, _ops} -> enqueue_patch_batch(next_session_state, ops, nil)
+            end
+
+          :error ->
+            # Component no longer exists (e.g. screen navigated away)
+            session_state
+        end
+    end
+  end
+
+  defp execute_effects([], session_state, _scope), do: session_state
+
+  defp execute_effects(effects, session_state, scope) when is_list(effects) do
+    Enum.reduce(effects, session_state, fn
+      {:async, fun, key}, state when is_function(fun, 0) and is_atom(key) ->
+        start_async_task(state, scope, key, fun)
+
+      {:send_after, msg, ms}, state when is_integer(ms) and ms >= 0 ->
+        Process.send_after(self(), msg, ms)
+        state
+
+      {:cancel_async, key}, state when is_atom(key) ->
+        cancel_async_task(state, scope, key)
+
+      unknown_effect, state ->
+        Logger.warning("unknown effect: #{inspect(unknown_effect)}")
+        state
+    end)
+  end
+
+  defp terminate_screen_and_components(state, reason) do
+    safe_terminate(state.screen_module, reason, state.screen_state)
+
+    Enum.each(state.live_components, fn {_name, %{module: mod, state: comp_state}} ->
+      safe_terminate(mod, reason, comp_state)
+    end)
+  end
+
+  defp safe_terminate(module, reason, %State{} = state) do
+    if function_exported?(module, :terminate, 2) do
+      try do
+        module.terminate(reason, state)
+      rescue
+        exception ->
+          Logger.error("terminate failed for #{inspect(module)}: #{Exception.message(exception)}")
+      end
+    end
+
+    :ok
   end
 
   defp put_logger_metadata(state) when is_map(state) do

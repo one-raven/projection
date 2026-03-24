@@ -460,7 +460,8 @@ defmodule Mix.Tasks.Projection.Codegen do
 
   defp normalize_field!(%{name: name, type: type, default: default, opts: opts})
        when is_atom(name) and type in @supported_schema_types and is_list(opts) do
-    %{name: name, type: type, default: default, opts: opts}
+    cleaned_opts = Keyword.drop(opts, [:direction, :derived, :from, :with])
+    %{name: name, type: type, default: default, opts: cleaned_opts}
   end
 
   defp normalize_field!(%{name: name, type: type, default: default})

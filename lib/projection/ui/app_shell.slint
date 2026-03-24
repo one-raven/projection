@@ -1,10 +1,12 @@
 export component AppShell inherits Rectangle {
     in property <string> app_title: "Projection";
     in property <bool> show_back: false;
+    in property <string> active_tab: "";
     in property <length> window_width: 480px;
     in property <length> window_height: 320px;
 
     callback nav_back();
+    callback navigate(string);
 
     background: #1a1a2e;
 

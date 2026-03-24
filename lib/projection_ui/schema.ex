@@ -1,24 +1,58 @@
 defmodule ProjectionUI.Schema do
   @moduledoc """
-  Typed view-model schema DSL for screen modules.
+  Typed view-model schema DSL for Projection modules.
 
-  Every screen must declare a `schema` block listing the fields visible to
-  the UI host. These declarations drive codegen (Rust setters) and compile-time
-  validation.
+  Every screen and component must declare a `schema` block listing the fields
+  visible to the UI host. These declarations drive codegen (Rust/Slint bindings)
+  and compile-time validation.
 
-  ## Supported types
+  ## Field types
 
     * `:string` — default `""`
     * `:bool` — default `false`
     * `:integer` — default `0`
     * `:float` — default `0.0`
     * `:map` — default `%{}`
-    * `:list` — default `[]` (`items: :string | :integer | :float | :bool`, default `:string`)
-    * `:id_table` — default `%{order: [], by_id: %{}}` (`columns: [name: :string, ...]`)
+    * `:list` — default `[]` (option: `items: :string | :integer | :float | :bool`)
+    * `:id_table` — default `%{order: [], by_id: %{}}` (option: `columns: [name: :type, ...]`)
 
-  Component fields are declared with `component/2,3` (not `field/3`):
+  ## Macros
 
-      component :status_badge, MyApp.Components.StatusBadge
+    * `field/3` — declares a named, typed field with optional `:default` and `:direction`
+    * `derived/3` — declares a field computed from another field (see below)
+    * `component/3` — declares a reusable component (static or live)
+
+  ## Derived fields
+
+  Derived fields are automatically recomputed by the Session whenever their
+  source field changes. They cannot be assigned directly.
+
+      schema do
+        field :celsius, :float
+        derived :fahrenheit, :float, from: :celsius, with: {__MODULE__, :to_f}
+      end
+
+      def to_f(c), do: c * 9 / 5 + 32
+
+  The `:with` option must be a `{Module, :function}` tuple (compile-time literal).
+  The function receives the source field's current value and returns the derived
+  value. In component schemas, derived fields are automatically `direction: :out`.
+
+  ## Property direction (components only)
+
+  Component fields support a `:direction` option that controls data flow:
+
+    * `:in` (default) — the parent sets this field; forwarded to `update/2`
+    * `:out` — the component sets this field; filtered out of parent assigns
+    * `:in_out` — both parent and component can set this field
+
+  Direction annotations are only valid in component schemas. They are rejected
+  at compile time for screen and app_state schemas.
+
+      schema do
+        field :raw_data, :list, items: :integer, direction: :in
+        field :display_label, :string, direction: :out
+      end
 
   ## Collection guidance
 
@@ -29,9 +63,10 @@ defmodule ProjectionUI.Schema do
   ## Example
 
       schema do
-        field :greeting, :string, default: "Hello!"
-        field :count, :integer
-        field :tiles, :list, items: :integer, default: [1, 2, 3]
+        field :title, :string, default: "Dashboard"
+        field :temperature, :float
+        derived :temp_label, :string, from: :temperature, with: {__MODULE__, :format_temp}
+        component :sidebar, MyApp.Components.Sidebar
       end
 
   """
@@ -40,6 +75,7 @@ defmodule ProjectionUI.Schema do
   @component_supported_types [:string, :bool, :integer, :float, :list, :id_table]
   @list_item_types [:string, :integer, :float, :bool]
   @id_table_column_types [:string, :integer, :float, :bool]
+  @allowed_directions [:in, :out, :in_out]
 
   defmacro __using__(opts) do
     owner = Keyword.get(opts, :owner)
@@ -50,7 +86,7 @@ defmodule ProjectionUI.Schema do
 
     quote do
       import ProjectionUI.Schema,
-        only: [schema: 1, field: 2, field: 3, component: 2, component: 3]
+        only: [schema: 1, field: 2, field: 3, component: 2, component: 3, derived: 3]
 
       Module.register_attribute(__MODULE__, :projection_schema_fields, accumulate: true)
       Module.register_attribute(__MODULE__, :projection_schema_declared, persist: false)
@@ -81,6 +117,13 @@ defmodule ProjectionUI.Schema do
 
   Accepts an optional `:default` value. If omitted, the type's zero-value is
   used (e.g. `""` for `:string`, `0` for `:integer`).
+
+  ## Options
+
+    * `:default` — override the type's zero-value default
+    * `:direction` — (component schemas only) `:in` (default), `:out`, or `:in_out`.
+      Controls whether the parent screen can push values to this field (`:in`),
+      the component produces values for the parent (`:out`), or both (`:in_out`).
   """
   defmacro field(name, type, opts \\ []) do
     caller = __CALLER__
@@ -90,6 +133,7 @@ defmodule ProjectionUI.Schema do
 
     validate_name!(expanded_name, caller)
     validate_type!(expanded_type, caller)
+    validate_direction!(expanded_opts, caller)
     validate_opts!(expanded_type, expanded_opts, caller)
 
     default =
@@ -101,6 +145,7 @@ defmodule ProjectionUI.Schema do
     normalized_opts =
       expanded_type
       |> normalize_field_opts(expanded_opts)
+      |> maybe_apply_direction(caller)
       |> Keyword.put(:default, default)
 
     validate_default!(expanded_name, expanded_type, default, normalized_opts, caller)
@@ -108,6 +153,113 @@ defmodule ProjectionUI.Schema do
     quote do
       @projection_schema_fields {unquote(expanded_name), unquote(expanded_type),
                                  unquote(Macro.escape(normalized_opts))}
+    end
+  end
+
+  @doc """
+  Declares a derived field that is automatically computed from a source field.
+
+  ## Options (required)
+
+    * `:from` — the source field name (must exist in the same schema)
+    * `:with` — a `{Module, :function_name}` tuple. The function receives the
+      source field value and returns the derived value.
+
+  Derived fields are automatically set to `direction: :out` in component schemas.
+  They cannot be directly assigned — use the source field instead.
+
+  ## Example
+
+      schema do
+        field :values, :list, items: :integer
+        derived :label, :string, from: :values, with: {__MODULE__, :values_label}
+      end
+
+      def values_label(values), do: Enum.join(values, ", ")
+  """
+  defmacro derived(name, type, opts) do
+    caller = __CALLER__
+    expanded_name = Macro.expand(name, caller)
+    expanded_type = Macro.expand(type, caller)
+
+    # Validate the opts contain the required :from and :with keys.
+    # The :with tuple contains a module ref that may not be a literal,
+    # so we handle it carefully.
+    expanded_opts = expand_derived_opts!(opts, caller)
+
+    validate_name!(expanded_name, caller)
+    validate_type!(expanded_type, caller)
+
+    from_field = Keyword.fetch!(expanded_opts, :from)
+    with_mfa = Keyword.fetch!(expanded_opts, :with)
+
+    unless is_atom(from_field) do
+      raise CompileError,
+        file: caller.file,
+        line: caller.line,
+        description: "derived field :from must be an atom, got: #{inspect(from_field)}"
+    end
+
+    case with_mfa do
+      {mod, fun} when is_atom(mod) and is_atom(fun) ->
+        :ok
+
+      other ->
+        raise CompileError,
+          file: caller.file,
+          line: caller.line,
+          description:
+            "derived field :with must be a {Module, :function} tuple, got: #{inspect(other)}"
+    end
+
+    owner = Module.get_attribute(caller.module, :projection_schema_owner)
+
+    direction_opts =
+      if owner == :component do
+        [direction: :out]
+      else
+        []
+      end
+
+    normalized_opts =
+      expanded_type
+      |> normalize_field_opts(Keyword.take(expanded_opts, [:default]))
+      |> Keyword.merge(direction_opts)
+      |> Keyword.merge(derived: true, from: from_field, with: with_mfa)
+
+    # Compute default from the source field's default using the with function.
+    # We defer this to __before_compile__ since the source field may not be declared yet.
+    # For now, store without a :default key — __before_compile__ will compute it.
+    quote do
+      @projection_schema_fields {unquote(expanded_name), unquote(expanded_type),
+                                 unquote(Macro.escape(normalized_opts))}
+    end
+  end
+
+  defp expand_derived_opts!(quoted, caller) do
+    expanded =
+      quoted
+      |> Macro.expand(caller)
+      |> normalize_signed_numeric_literals()
+
+    # Try full literal expansion first
+    if Macro.quoted_literal?(expanded) do
+      {value, _binding} = Code.eval_quoted(expanded, [], caller)
+      value
+    else
+      # For derived opts, the :with tuple may contain __MODULE__ which expands
+      # to a module reference. Try evaluating it in the caller's context.
+      try do
+        {value, _binding} = Code.eval_quoted(expanded, [], caller)
+        value
+      rescue
+        _ ->
+          raise CompileError,
+            file: caller.file,
+            line: caller.line,
+            description:
+              "derived field options must be compile-time literals, got: #{Macro.to_string(quoted)}"
+      end
     end
   end
 
@@ -141,11 +293,15 @@ defmodule ProjectionUI.Schema do
   defmacro __before_compile__(env) do
     ensure_schema_declared!(env)
 
-    normalized_schema =
+    raw_fields =
       env.module
       |> Module.get_attribute(:projection_schema_fields)
       |> Enum.reverse()
-      |> normalize_schema!(env)
+
+    # Compute defaults for derived fields before normalization
+    resolved_fields = resolve_derived_defaults!(raw_fields, env)
+
+    normalized_schema = normalize_schema!(resolved_fields, env)
 
     defaults = Map.new(normalized_schema, fn field -> {field.name, field.default} end)
 
@@ -204,6 +360,46 @@ defmodule ProjectionUI.Schema do
     end)
 
     :ok
+  end
+
+  defp resolve_derived_defaults!(fields, env) do
+    # Build a map of field name -> {type, opts} for non-derived fields
+    source_defaults =
+      fields
+      |> Enum.reject(fn {_name, _type, opts} -> Keyword.get(opts, :derived, false) end)
+      |> Map.new(fn {name, _type, opts} ->
+        default =
+          case Keyword.fetch(opts, :default) do
+            {:ok, value} -> value
+            :error -> nil
+          end
+
+        {name, default}
+      end)
+
+    Enum.map(fields, fn {name, type, opts} = field_tuple ->
+      if Keyword.get(opts, :derived, false) do
+        from_field = Keyword.fetch!(opts, :from)
+        {with_mod, with_fun} = Keyword.fetch!(opts, :with)
+
+        # Validate that from references an existing field
+        unless Map.has_key?(source_defaults, from_field) do
+          raise CompileError,
+            file: env.file,
+            line: env.line,
+            description:
+              "derived field #{inspect(name)} references non-existent source field #{inspect(from_field)}"
+        end
+
+        # Compute default from source field's default
+        source_default = Map.fetch!(source_defaults, from_field)
+        computed_default = apply(with_mod, with_fun, [source_default])
+
+        {name, type, Keyword.put(opts, :default, computed_default)}
+      else
+        field_tuple
+      end
+    end)
   end
 
   defp normalize_schema!(fields, env) do
@@ -311,7 +507,7 @@ defmodule ProjectionUI.Schema do
       opts
       |> Keyword.keys()
       |> Enum.uniq()
-      |> Enum.reject(&(&1 in [:default, :columns]))
+      |> Enum.reject(&(&1 in [:default, :columns, :direction]))
 
     if unknown_keys != [] do
       raise CompileError,
@@ -339,7 +535,7 @@ defmodule ProjectionUI.Schema do
       opts
       |> Keyword.keys()
       |> Enum.uniq()
-      |> Enum.reject(&(&1 in [:default, :items]))
+      |> Enum.reject(&(&1 in [:default, :items, :direction]))
 
     if unknown_keys != [] do
       raise CompileError,
@@ -369,6 +565,45 @@ defmodule ProjectionUI.Schema do
       file: caller.file,
       line: caller.line,
       description: "field options must be a keyword list, got: #{inspect(opts)}"
+  end
+
+  defp validate_direction!(opts, caller) when is_list(opts) do
+    case Keyword.fetch(opts, :direction) do
+      {:ok, dir} when dir in @allowed_directions ->
+        owner = Module.get_attribute(caller.module, :projection_schema_owner)
+
+        if owner in [:screen, :app_state] do
+          raise CompileError,
+            file: caller.file,
+            line: caller.line,
+            description:
+              ":direction option is only valid for component schemas, not #{inspect(owner)} schemas"
+        end
+
+        :ok
+
+      {:ok, invalid} ->
+        raise CompileError,
+          file: caller.file,
+          line: caller.line,
+          description:
+            "invalid :direction value #{inspect(invalid)}. Allowed: #{inspect(@allowed_directions)}"
+
+      :error ->
+        :ok
+    end
+  end
+
+  defp maybe_apply_direction(opts, caller) when is_list(opts) do
+    owner = Module.get_attribute(caller.module, :projection_schema_owner)
+
+    case {owner, Keyword.has_key?(opts, :direction)} do
+      {:component, false} ->
+        Keyword.put(opts, :direction, :in)
+
+      _ ->
+        opts
+    end
   end
 
   defp validate_default!(name, type, default, opts, caller) do
