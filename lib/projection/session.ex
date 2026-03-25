@@ -288,7 +288,15 @@ defmodule Projection.Session do
         rev = state.rev + 1
         next_state = maybe_schedule_tick(%{state | sid: sid, rev: rev})
         put_logger_metadata(next_state)
-        Logger.info("ui ready received; sending render snapshot")
+
+        case get_in(envelope, ["capabilities", "resync_reason"]) do
+          reason when is_binary(reason) and reason != "" ->
+            Logger.warning("ui resync requested: #{reason}")
+
+          _ ->
+            Logger.info("ui ready received; sending render snapshot")
+        end
+
         render = Protocol.render_envelope(sid, rev, state.vm)
         {:ok, [render], next_state}
 

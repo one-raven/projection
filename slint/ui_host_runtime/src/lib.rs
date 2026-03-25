@@ -11,6 +11,7 @@ use std::thread;
 
 pub use crate::protocol::{
     ELIXIR_TO_UI_CAP, ElixirEnvelope, PatchOp, UI_TO_ELIXIR_CAP, UiEnvelope,
+    ready_envelope_with_reason,
 };
 pub use serde_json;
 
@@ -160,6 +161,15 @@ pub fn run<B: HostBindings>() -> Result<(), Box<dyn std::error::Error>> {
                     }
 
                     if let Err(err) = apply_render::<B>(&ui, &vm, &mut state) {
+                        let screen = vm.pointer("/screen/name")
+                            .and_then(Value::as_str)
+                            .unwrap_or("unknown");
+                        show_error_screen::<B>(
+                            &ui,
+                            "Render Error",
+                            &err,
+                            screen,
+                        );
                         reset_for_resync(&mut state);
                         request_resync(
                             &tx_for_resync,
@@ -218,6 +228,15 @@ pub fn run<B: HostBindings>() -> Result<(), Box<dyn std::error::Error>> {
                     }
 
                     if let Err(err) = apply_patch::<B>(&ui, &ops, &mut state) {
+                        let screen = state.vm.pointer("/screen/name")
+                            .and_then(Value::as_str)
+                            .unwrap_or("unknown");
+                        show_error_screen::<B>(
+                            &ui,
+                            "Patch Error",
+                            &err,
+                            screen,
+                        );
                         reset_for_resync(&mut state);
                         request_resync(
                             &tx_for_resync,
@@ -426,7 +445,18 @@ fn request_resync(
 
     eprintln!("{reason}; requesting resync");
 
-    enqueue_control_envelope(tx.clone(), ready_envelope(sid.to_string()), queue_capacity);
+    enqueue_control_envelope(
+        tx.clone(),
+        ready_envelope_with_reason(sid.to_string(), Some(reason.to_string())),
+        queue_capacity,
+    );
+}
+
+fn show_error_screen<B: HostBindings>(ui: &B::Ui, title: &str, message: &str, screen_module: &str) {
+    B::set_active_screen(ui, "error");
+    B::set_error_title(ui, title);
+    B::set_error_message(ui, message);
+    B::set_error_screen_module(ui, screen_module);
 }
 
 fn apply_render<B: HostBindings>(

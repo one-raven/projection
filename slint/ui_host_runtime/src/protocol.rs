@@ -57,12 +57,22 @@ pub enum PatchOp {
 }
 
 pub fn ready_envelope(sid: String) -> UiEnvelope {
+    ready_envelope_with_reason(sid, None)
+}
+
+pub fn ready_envelope_with_reason(sid: String, reason: Option<String>) -> UiEnvelope {
+    let mut caps = serde_json::json!({
+        "m1": true,
+        "transport": "stdio-packet-4"
+    });
+
+    if let Some(reason) = reason {
+        caps["resync_reason"] = serde_json::Value::String(reason);
+    }
+
     UiEnvelope::Ready {
         sid,
-        capabilities: serde_json::json!({
-            "m1": true,
-            "transport": "stdio-packet-4"
-        }),
+        capabilities: caps,
     }
 }
 
