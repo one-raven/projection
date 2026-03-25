@@ -41,6 +41,9 @@ defmodule ProjectionUI.Screen do
     * `{:send_after, message, milliseconds}` — schedules a message to arrive
       via `c:handle_info/2` after the given delay.
     * `{:cancel_async, key}` — cancels an active async task for the given key.
+    * `{:navigate, route_name}` — navigates to a different screen by route name.
+    * `{:navigate, route_name, params}` — navigates with route params.
+    * `{:back}` — pops the navigation stack (goes back).
 
   Effects are executed by the Session after state changes are applied and patches
   are sent, so the UI sees the immediate state update before async work begins.

@@ -1581,6 +1581,16 @@ defmodule Projection.Session do
       {:cancel_async, key}, state when is_atom(key) ->
         cancel_async_task(state, scope, key)
 
+      {:navigate, route_name}, state when is_binary(route_name) ->
+        apply_route_navigate(state, %{"to" => route_name}, nil)
+
+      {:navigate, route_name, params}, state
+      when is_binary(route_name) and is_map(params) ->
+        apply_route_navigate(state, %{"to" => route_name, "params" => params}, nil)
+
+      {:back}, state ->
+        apply_route_back(state, nil)
+
       unknown_effect, state ->
         Logger.warning("unknown effect: #{inspect(unknown_effect)}")
         state

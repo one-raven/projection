@@ -268,6 +268,117 @@ defmodule Projection.SessionRouterTest do
     assert_receive {:subscription, :subscribe, "clock.timezone:America/Chicago"}, 200
   end
 
+  defmodule NavigateEffectScreen do
+    use ProjectionUI, :screen
+
+    schema do
+      field(:status, :string, default: "ready")
+    end
+
+    @impl true
+    def handle_event("go_devices", _payload, state) do
+      {:noreply, assign(state, :status, "navigating"),
+       effects: [{:navigate, "devices", %{"count" => 3}}]}
+    end
+
+    def handle_event("go_back", _payload, state) do
+      {:noreply, state, effects: [{:back}]}
+    end
+
+    def handle_event(_event, _payload, state), do: {:noreply, state}
+  end
+
+  defmodule NavigateEffectRouter do
+    use Projection.Router.DSL
+
+    screen_session :main do
+      screen("/nav_test", NavigateEffectScreen, :show, as: :nav_test)
+      screen("/devices", Projection.TestScreens.Devices, :index, as: :devices)
+    end
+  end
+
+  test "navigate effect triggers server-side route transition" do
+    {:ok, session} =
+      start_supervised(
+        {Session,
+         [
+           sid: "S1",
+           router: NavigateEffectRouter,
+           route: "nav_test",
+           host_bridge: self()
+         ]}
+      )
+
+    assert {:ok, [_render]} =
+             Session.handle_ui_envelope_sync(session, %{"t" => "ready", "sid" => "S1"})
+
+    # Trigger the navigate effect from handle_event
+    assert {:ok, []} =
+             Session.handle_ui_envelope_sync(session, %{
+               "t" => "intent",
+               "sid" => "S1",
+               "id" => 30,
+               "name" => "go_devices",
+               "payload" => %{}
+             })
+
+    assert_receive {:"$gen_cast", {:send_envelope, patch}}, 200
+    assert patch["t"] == "patch"
+
+    snapshot = Session.snapshot(session)
+    assert snapshot.screen_module == Projection.TestScreens.Devices
+    assert snapshot.vm.screen.name == "devices"
+  end
+
+  test "back effect pops the navigation stack" do
+    {:ok, session} =
+      start_supervised(
+        {Session,
+         [
+           sid: "S1",
+           router: NavigateEffectRouter,
+           route: "nav_test",
+           host_bridge: self()
+         ]}
+      )
+
+    assert {:ok, [_render]} =
+             Session.handle_ui_envelope_sync(session, %{"t" => "ready", "sid" => "S1"})
+
+    # First navigate to devices
+    assert {:ok, []} =
+             Session.handle_ui_envelope_sync(session, %{
+               "t" => "intent",
+               "sid" => "S1",
+               "id" => 31,
+               "name" => "go_devices",
+               "payload" => %{}
+             })
+
+    assert_receive {:"$gen_cast", {:send_envelope, _}}, 200
+
+    snapshot = Session.snapshot(session)
+    assert snapshot.vm.screen.name == "devices"
+    assert length(snapshot.vm.nav.stack) == 2
+
+    # Now go back via the back effect — need to navigate back to nav_test screen first
+    # Since we're on devices screen now, we use ui.back intent instead
+    assert {:ok, []} =
+             Session.handle_ui_envelope_sync(session, %{
+               "t" => "intent",
+               "sid" => "S1",
+               "id" => 32,
+               "name" => "ui.back",
+               "payload" => %{}
+             })
+
+    assert_receive {:"$gen_cast", {:send_envelope, _}}, 200
+
+    snapshot = Session.snapshot(session)
+    assert snapshot.vm.screen.name == "nav_test"
+    assert length(snapshot.vm.nav.stack) == 1
+  end
+
   test "render errors are surfaced as error screen vm and session stays alive" do
     {:ok, session} =
       start_supervised(
