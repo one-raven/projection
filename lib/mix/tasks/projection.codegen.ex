@@ -1458,11 +1458,11 @@ defmodule Mix.Tasks.Projection.Codegen do
     parse_fn = rust_list_parse_fn(opts)
 
     """
-    let raw_values = parsed
-            .columns
-            .get("#{column_name}")
-            .cloned()
-            .ok_or_else(|| format!("missing id_table column '#{column_name}'"))?;
+    let raw_values = match parsed.columns.get("#{column_name}") {
+        Some(v) => v.clone(),
+        None if parsed.ids.is_empty() => Vec::new(),
+        None => return Err(format!("missing id_table column '#{column_name}'")),
+    };
     if raw_values.len() != parsed.ids.len() {
         return Err(format!(
             "inconsistent id_table column '#{column_name}' length: expected {}, got {}",
