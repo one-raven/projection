@@ -5,6 +5,5 @@ fn main() {
     println!("cargo:rerun-if-changed=src/generated/screen_host.slint");
     println!("cargo:rerun-if-changed=src/generated/routes.slint");
     println!("cargo:rerun-if-changed=src/generated/error_state.slint");
-    println!("cargo:rerun-if-changed=src/generated/clock_state.slint");
     println!("cargo:rerun-if-changed=../../lib/projection/ui/");
 }

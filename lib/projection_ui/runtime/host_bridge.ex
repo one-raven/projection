@@ -123,6 +123,7 @@ defmodule ProjectionUI.HostBridge do
 
   def handle_info({port, {:exit_status, status}}, %{port: port} = state) do
     put_logger_metadata(state)
+    close_port(port)
     state = reset_backoff_if_stable(%{state | port: nil, connected_at: nil})
     Logger.warning("ui_host exited with status #{status}; scheduling reconnect")
     emit_error(:port_exit_status, state, %{status: status})
@@ -131,6 +132,7 @@ defmodule ProjectionUI.HostBridge do
 
   def handle_info({:EXIT, port, reason}, %{port: port} = state) do
     put_logger_metadata(state)
+    close_port(port)
     state = reset_backoff_if_stable(%{state | port: nil, connected_at: nil})
     Logger.warning("ui_host port exit #{inspect(reason)}; scheduling reconnect")
     emit_error(:port_exit, state, %{reason: inspect(reason)})
@@ -144,16 +146,21 @@ defmodule ProjectionUI.HostBridge do
 
   @impl true
   def terminate(_reason, %{port: port}) when is_port(port) do
+    close_port(port)
+    :ok
+  end
+
+  def terminate(_reason, _state), do: :ok
+
+  defp close_port(port) when is_port(port) do
     try do
       Port.close(port)
     catch
       :error, _ -> :ok
     end
-
-    :ok
   end
 
-  def terminate(_reason, _state), do: :ok
+  defp close_port(_), do: :ok
 
   defp dispatch_to_port(envelope, %{port: nil} = state) do
     maybe_track_sid_from_envelope(envelope, state)
@@ -162,7 +169,14 @@ defmodule ProjectionUI.HostBridge do
   defp dispatch_to_port(envelope, %{port: port} = state) do
     case Protocol.encode_outbound(envelope) do
       {:ok, payload} ->
-        true = Port.command(port, payload)
+        try do
+          Port.command(port, payload)
+        rescue
+          ArgumentError ->
+            Logger.warning("ui_host port closed during send; scheduling reconnect")
+            emit_error(:port_closed_during_send, state, %{source: :encode_outbound})
+        end
+
         maybe_track_sid_from_envelope(envelope, state)
 
       {:error, reason} ->
