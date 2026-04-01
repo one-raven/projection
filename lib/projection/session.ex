@@ -149,6 +149,7 @@ defmodule Projection.Session do
       |> sync_subscriptions()
 
     state = %{state | vm: initial_vm(state)}
+    state = drain_mount_async(state)
     put_logger_metadata(state)
     {:ok, state}
   end
@@ -1034,6 +1035,9 @@ defmodule Projection.Session do
 
     next_state = %{next_state | live_components: next_live_components}
 
+    # Drain pending_async from any components that queued tasks during update/2
+    next_state = drain_component_pending_async(next_state)
+
     # Merge component changed fields so the differ targets component VM paths
     all_changed_fields = Enum.uniq(changed_fields ++ component_changed_fields)
 
@@ -1484,6 +1488,23 @@ defmodule Projection.Session do
       :error ->
         session_state
     end
+  end
+
+  # Drains pending_async tasks queued during mount for both the screen and
+  # any live components. Without this, async_assign calls made in mount/3
+  # would not actually spawn their tasks until the first apply_screen_update.
+  defp drain_mount_async(state) do
+    {state, screen_state} = drain_pending_async(state, :screen, state.screen_state)
+    state = %{state | screen_state: screen_state}
+    drain_component_pending_async(state)
+  end
+
+  defp drain_component_pending_async(state) do
+    Enum.reduce(state.live_components, state, fn {name, comp}, acc ->
+      {next_acc, comp_state} = drain_pending_async(acc, {:component, name}, comp.state)
+      next_components = Map.update!(next_acc.live_components, name, &%{&1 | state: comp_state})
+      %{next_acc | live_components: next_components}
+    end)
   end
 
   defp cancel_all_async_tasks(session_state) do
