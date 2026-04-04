@@ -60,6 +60,13 @@ defmodule ProjectionUI.Schema do
   where row-level updates matter, prefer `:id_table` so patches can target
   stable IDs instead of replacing full lists.
 
+  Codegen converts each `:id_table` field into a Slint `export struct` and a
+  single `[Struct]` model property. For example, a field named `:devices` with
+  `columns: [name: :string, online: :bool]` generates a `DevicesRow` struct
+  with `id`, `name`, and `online` fields, and a property `<[DevicesRow]> devices`.
+  Screen `.slint` files import the struct from the generated `types.slint`
+  in their ui_root and declare `in property <[DevicesRow]> devices: [];`.
+
   ## Example
 
       schema do

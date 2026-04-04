@@ -64,6 +64,7 @@ The host bridges those loops through framed stdio messages.
 - Screen `schema do ... end` defines typed VM fields used by codegen.
 - `:list` fields default to string lists; use `items: :integer | :float | :bool | :string` for typed lists.
 - `:id_table` fields require typed columns, for example `columns: [name: :string, pos: :integer]`.
+- Codegen generates a Slint `export struct` and `[Struct]` model property for each `:id_table` field (see below).
 - Generated bindings connect patch paths to concrete Slint property setters.
 
 ## Install
@@ -534,6 +535,68 @@ For Slint bindings, component fields are flattened with a prefix:
 
 - `status_badge.label` -> `status_badge_label`
 - `status_badge.status` -> `status_badge_status`
+
+## id_table fields and Slint structs
+
+`:id_table` fields are for collections where row-level updates matter. The Elixir side
+uses a keyed map structure (`%{order: [...], by_id: %{...}}`), and the Session diffs
+only the rows that changed.
+
+Codegen automatically generates a Slint struct and a single `[Struct]` model property
+for each `:id_table` field:
+
+```elixir
+schema do
+  field :devices, :id_table,
+    columns: [name: :string, status: :string, online: :bool],
+    default: %{order: [], by_id: %{}}
+end
+```
+
+This generates:
+
+```slint
+export struct DevicesRow {
+    id: string,
+    name: string,
+    status: string,
+    online: bool,
+}
+
+export global DevicesState {
+    in property <[DevicesRow]> devices: [];
+}
+```
+
+Codegen also generates a `types.slint` file in your ui_root containing
+all struct definitions. Import the struct type in your screen file and declare
+the model as an `in property`:
+
+```slint
+import { DevicesRow } from "types.slint";
+
+export component RoomsScreen inherits Screen {
+    in property <[DevicesRow]> devices: [];
+
+    for device[index] in root.devices: DeviceCard {
+        name: device.name;
+        status: device.status;
+        online: device.online;
+        card-tapped(idx) => { root.show-sheet(idx); }
+    }
+}
+```
+
+The struct always includes an `id: string` field (from the id_table's `order` array)
+followed by one field per declared column, mapped to Slint types (`string`, `int`,
+`float`, `bool`).
+
+The struct name is derived from the field name: `devices` becomes `DevicesRow`,
+`sensor_readings` becomes `SensorReadingsRow`. The generated `screen_host.slint`
+passes the model to the screen as a property binding automatically.
+
+On the Rust side, codegen generates a helper that parses the id_table JSON and
+constructs a `VecModel<Struct>` with one row per entry.
 
 ## Define a screen
 

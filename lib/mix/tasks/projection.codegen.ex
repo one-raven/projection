@@ -6,6 +6,18 @@ defmodule Mix.Tasks.Projection.Codegen do
   @moduledoc """
   Generates Rust binding glue under `slint/ui_host/src/generated/` from
   `__projection_schema__/0` metadata exported by screen modules.
+
+  For each screen, generates:
+
+    * `<screen>_state.slint` — Slint global with typed properties for each field.
+      `:id_table` fields produce an `export struct <Name>Row` and a single
+      `[<Name>Row]` model property. Struct definitions are also written to
+      `types.slint` in the ui_root for screen file imports.
+    * `<screen>.rs` — Rust module with `apply_render` and `apply_patch` functions
+      that map JSON values to Slint property setters.
+
+  Also generates shared files: `mod.rs`, `routes.slint`, `screen_host.slint`,
+  `app.slint`, `error_state.slint`, and `build.rs`.
   """
 
   @supported_schema_types [:string, :bool, :integer, :float, :map, :list, :id_table, :component]
@@ -55,7 +67,7 @@ defmodule Mix.Tasks.Projection.Codegen do
           slint =
             write_file_if_changed(
               Path.join(generated_dir, spec.state_file),
-              render_screen_state_slint(spec)
+              render_screen_state_slint(spec, ui_root_from_generated)
             )
 
           {rs, slint}
@@ -111,6 +123,12 @@ defmodule Mix.Tasks.Projection.Codegen do
         render_error_state_slint()
       )
 
+    types_result =
+      write_file_if_changed(
+        Path.join(File.cwd!(), Path.join(ui_root, "types.slint")),
+        render_projection_types_slint(specs)
+      )
+
     build_rs_result =
       write_file_if_changed(
         Path.join(File.cwd!(), "slint/ui_host/build.rs"),
@@ -130,6 +148,7 @@ defmodule Mix.Tasks.Projection.Codegen do
             screen_host_result,
             app_result,
             error_state_result,
+            types_result,
             build_rs_result
           ],
         fn
@@ -497,31 +516,19 @@ defmodule Mix.Tasks.Projection.Codegen do
 
   defp expand_codegen_field(%{name: name, type: :id_table, default: default, opts: opts}) do
     columns = id_table_columns(opts)
+    struct_name = camelize(Atom.to_string(name)) <> "Row"
 
-    ids_default = Map.get(default, :order, [])
-
-    id_field = %{
-      name: :"#{name}_ids",
-      type: :list,
-      default: ids_default,
-      opts: [items: :string],
-      source: %{kind: :id_table, root: name, role: :ids}
-    }
-
-    column_fields =
-      Enum.map(columns, fn %{name: column_name, type: column_type} = column ->
-        column_values_default = id_table_column_values(default, column)
-
-        %{
-          name: :"#{name}_#{column_name}",
-          type: :list,
-          default: column_values_default,
-          opts: [items: column_type],
-          source: %{kind: :id_table, root: name, role: {:column, column_name}}
-        }
-      end)
-
-    [id_field | column_fields]
+    [
+      %{
+        name: name,
+        type: :id_table_struct,
+        default: default,
+        opts: opts,
+        source: %{kind: :id_table_struct, root: name},
+        struct_name: struct_name,
+        columns: columns
+      }
+    ]
   end
 
   defp expand_codegen_field(%{name: name, type: :component, default: default, opts: opts}) do
@@ -553,40 +560,23 @@ defmodule Mix.Tasks.Projection.Codegen do
          component_default
        ) do
     columns = id_table_columns(opts)
-    ids_default = Map.get(component_default, :order, [])
+    struct_name = camelize("#{component_root}_#{field_name}") <> "Row"
 
-    id_field = %{
-      name: :"#{component_root}_#{field_name}_ids",
-      type: :list,
-      default: ids_default,
-      opts: [items: :string],
-      source: %{
-        kind: :component_id_table,
-        component: component_root,
-        root: field_name,
-        role: :ids
+    [
+      %{
+        name: :"#{component_root}_#{field_name}",
+        type: :id_table_struct,
+        default: component_default,
+        opts: opts,
+        source: %{
+          kind: :component_id_table_struct,
+          component: component_root,
+          root: field_name
+        },
+        struct_name: struct_name,
+        columns: columns
       }
-    }
-
-    column_fields =
-      Enum.map(columns, fn %{name: column_name, type: column_type} = column ->
-        column_values_default = id_table_column_values(component_default, column)
-
-        %{
-          name: :"#{component_root}_#{field_name}_#{column_name}",
-          type: :list,
-          default: column_values_default,
-          opts: [items: column_type],
-          source: %{
-            kind: :component_id_table,
-            component: component_root,
-            root: field_name,
-            role: {:column, column_name}
-          }
-        }
-      end)
-
-    [id_field | column_fields]
+    ]
   end
 
   defp expand_component_codegen_field(
@@ -871,22 +861,10 @@ defmodule Mix.Tasks.Projection.Codegen do
       global_type = "crate::#{global_name}"
       direct_fields = Enum.filter(spec.fields, &(&1.source.kind == :direct))
       component_fields = Enum.filter(spec.fields, &(&1.source.kind == :component))
-      id_table_fields = Enum.filter(spec.fields, &(&1.source.kind == :id_table))
+      id_table_struct_fields = Enum.filter(spec.fields, &(&1.source.kind == :id_table_struct))
 
-      component_id_table_fields =
-        Enum.filter(spec.fields, &(&1.source.kind == :component_id_table))
-
-      id_table_roots =
-        id_table_fields
-        |> Enum.group_by(& &1.source.root)
-        |> Enum.sort_by(fn {root, _fields} -> Atom.to_string(root) end)
-
-      component_id_table_roots =
-        component_id_table_fields
-        |> Enum.group_by(fn field -> {field.source.component, field.source.root} end)
-        |> Enum.sort_by(fn {{component, root}, _fields} ->
-          {Atom.to_string(component), Atom.to_string(root)}
-        end)
+      component_id_table_struct_fields =
+        Enum.filter(spec.fields, &(&1.source.kind == :component_id_table_struct))
 
       component_direct_groups =
         component_fields
@@ -895,12 +873,12 @@ defmodule Mix.Tasks.Projection.Codegen do
           {component, Enum.sort_by(fields, &Atom.to_string(&1.name))}
         end)
 
-      component_id_table_by_component =
-        component_id_table_roots
-        |> Enum.group_by(fn {{component, _root}, _fields} -> component end)
+      component_id_table_struct_by_component =
+        component_id_table_struct_fields
+        |> Enum.group_by(& &1.source.component)
 
       component_roots =
-        (Map.keys(component_direct_groups) ++ Map.keys(component_id_table_by_component))
+        (Map.keys(component_direct_groups) ++ Map.keys(component_id_table_struct_by_component))
         |> Enum.uniq()
         |> Enum.sort_by(&Atom.to_string/1)
 
@@ -908,12 +886,12 @@ defmodule Mix.Tasks.Projection.Codegen do
         Enum.map(component_roots, fn component ->
           direct_group = Map.get(component_direct_groups, component, [])
 
-          id_table_group =
-            component_id_table_by_component
+          id_table_struct_group =
+            component_id_table_struct_by_component
             |> Map.get(component, [])
-            |> Enum.sort_by(fn {{_component, root}, _fields} -> Atom.to_string(root) end)
+            |> Enum.sort_by(&Atom.to_string(&1.name))
 
-          {component, direct_group, id_table_group}
+          {component, direct_group, id_table_struct_group}
         end)
 
       direct_render_setters =
@@ -924,7 +902,7 @@ defmodule Mix.Tasks.Projection.Codegen do
 
       component_render_setters =
         component_root_groups
-        |> Enum.map_join("\n", fn {component, direct_group, id_table_group} ->
+        |> Enum.map_join("\n", fn {component, direct_group, id_table_struct_group} ->
           component_name = Atom.to_string(component)
           component_vm = component_vm_var(component)
 
@@ -934,14 +912,14 @@ defmodule Mix.Tasks.Projection.Codegen do
               "        set_#{field.name}_from_component(&g, #{component_vm})?;"
             end)
 
-          component_id_table_setters =
-            id_table_group
-            |> Enum.map_join("\n", fn {{_component, root}, _fields} ->
-              "        apply_component_id_table_#{component}_#{root}_from_component(&g, #{component_vm})?;"
+          component_id_table_struct_setters =
+            id_table_struct_group
+            |> Enum.map_join("\n", fn field ->
+              "        apply_id_table_struct_#{field.name}_from_component(&g, #{component_vm})?;"
             end)
 
           setters =
-            [component_direct_setters, component_id_table_setters]
+            [component_direct_setters, component_id_table_struct_setters]
             |> Enum.reject(&(&1 == ""))
             |> Enum.join("\n")
 
@@ -953,14 +931,14 @@ defmodule Mix.Tasks.Projection.Codegen do
           """
         end)
 
-      id_table_render_setters =
-        id_table_roots
-        |> Enum.map_join("\n", fn {root, _fields} ->
-          "        apply_id_table_#{root}_from_vm(&g, screen_vm)?;"
+      id_table_struct_render_setters =
+        id_table_struct_fields
+        |> Enum.map_join("\n", fn field ->
+          "        apply_id_table_struct_#{field.name}_from_vm(&g, screen_vm)?;"
         end)
 
       render_field_setters =
-        [direct_render_setters, component_render_setters, id_table_render_setters]
+        [direct_render_setters, component_render_setters, id_table_struct_render_setters]
         |> Enum.reject(&(&1 == ""))
         |> Enum.join("\n")
 
@@ -969,12 +947,13 @@ defmodule Mix.Tasks.Projection.Codegen do
           direct_fields |> Enum.map_join("\n", &render_patch_apply_line/1),
           component_fields |> Enum.map_join("\n", &render_patch_apply_line/1),
           component_root_groups
-          |> Enum.map_join("\n", fn {component, direct_group, id_table_group} ->
-            render_component_root_patch_apply_line(component, direct_group, id_table_group)
+          |> Enum.map_join("\n", fn {component, direct_group, id_table_struct_group} ->
+            render_component_root_patch_apply_line(component, direct_group, id_table_struct_group)
           end),
-          id_table_roots |> Enum.map_join("\n", &render_id_table_patch_apply_line/1),
-          component_id_table_roots
-          |> Enum.map_join("\n", &render_component_id_table_patch_apply_line/1)
+          id_table_struct_fields
+          |> Enum.map_join("\n", &render_id_table_struct_patch_apply_line/1),
+          component_id_table_struct_fields
+          |> Enum.map_join("\n", &render_component_id_table_struct_patch_apply_line/1)
         ]
         |> Enum.reject(&(&1 == ""))
         |> Enum.join("\n")
@@ -984,12 +963,17 @@ defmodule Mix.Tasks.Projection.Codegen do
           direct_fields |> Enum.map_join("\n", &render_remove_apply_line/1),
           component_fields |> Enum.map_join("\n", &render_remove_apply_line/1),
           component_root_groups
-          |> Enum.map_join("\n", fn {component, direct_group, id_table_group} ->
-            render_component_root_remove_apply_line(component, direct_group, id_table_group)
+          |> Enum.map_join("\n", fn {component, direct_group, id_table_struct_group} ->
+            render_component_root_remove_apply_line(
+              component,
+              direct_group,
+              id_table_struct_group
+            )
           end),
-          id_table_roots |> Enum.map_join("\n", &render_id_table_remove_apply_line/1),
-          component_id_table_roots
-          |> Enum.map_join("\n", &render_component_id_table_remove_apply_line/1)
+          id_table_struct_fields
+          |> Enum.map_join("\n", &render_id_table_struct_remove_apply_line/1),
+          component_id_table_struct_fields
+          |> Enum.map_join("\n", &render_component_id_table_struct_remove_apply_line/1)
         ]
         |> Enum.reject(&(&1 == ""))
         |> Enum.join("\n")
@@ -1002,61 +986,47 @@ defmodule Mix.Tasks.Projection.Codegen do
         component_fields
         |> Enum.map_join("\n", &render_field_helper(&1, global_type))
 
-      id_table_field_helpers =
-        id_table_fields
-        |> Enum.map_join("\n", &render_field_helper(&1, global_type))
+      id_table_struct_helpers =
+        id_table_struct_fields
+        |> Enum.map_join("\n", &render_id_table_struct_root_helper(&1, global_type))
 
-      component_id_table_field_helpers =
-        component_id_table_fields
-        |> Enum.map_join("\n", &render_field_helper(&1, global_type))
-
-      id_table_root_helpers =
-        id_table_roots
-        |> Enum.map_join("\n", fn {root, fields} ->
-          render_id_table_root_helper(root, fields, global_type)
-        end)
-
-      component_id_table_root_helpers =
-        component_id_table_roots
-        |> Enum.map_join("\n", fn {root_tuple, fields} ->
-          render_component_id_table_root_helper(root_tuple, fields, global_type)
-        end)
+      component_id_table_struct_helpers =
+        component_id_table_struct_fields
+        |> Enum.map_join("\n", &render_component_id_table_struct_root_helper(&1, global_type))
 
       field_helpers =
         [
           direct_field_helpers,
           component_field_helpers,
-          id_table_field_helpers,
-          component_id_table_field_helpers,
-          id_table_root_helpers,
-          component_id_table_root_helpers
+          id_table_struct_helpers,
+          component_id_table_struct_helpers
         ]
         |> Enum.reject(&(&1 == ""))
         |> Enum.join("\n")
 
       parse_helpers =
-        (direct_fields ++ component_fields ++ id_table_fields ++ component_id_table_fields)
+        (direct_fields ++ component_fields)
         |> Enum.map(&parse_helper_key/1)
         |> Enum.uniq()
         |> Enum.sort_by(&parse_helper_sort_key/1)
         |> Enum.map_join("\n", &render_parse_helper/1)
 
       id_table_helpers =
-        if id_table_fields != [] or component_id_table_fields != [] do
+        if id_table_struct_fields != [] or component_id_table_struct_fields != [] do
           render_id_table_helpers()
         else
           ""
         end
 
       patch_screen_vm_line =
-        if id_table_roots == [] and component_id_table_roots == [] do
+        if id_table_struct_fields == [] and component_id_table_struct_fields == [] do
           ""
         else
           "    let screen_vm = vm.pointer(\"/screen/vm\").and_then(Value::as_object);\n"
         end
 
       patch_vm_param =
-        if id_table_roots == [] and component_id_table_roots == [] do
+        if id_table_struct_fields == [] and component_id_table_struct_fields == [] do
           "_vm"
         else
           "vm"
@@ -1218,70 +1188,6 @@ defmodule Mix.Tasks.Projection.Codegen do
     """
   end
 
-  defp render_field_helper(
-         %{
-           name: name,
-           opts: opts,
-           default: default,
-           source: %{kind: :id_table, root: _root, role: role}
-         },
-         global_name
-       ) do
-    field = Atom.to_string(name)
-    default_literal = rust_literal(:list, default, opts)
-    extract_expr = rust_id_table_extract_expr(role, opts)
-    model_expr = rust_list_model_from_values_expr(opts, "values", "path")
-
-    """
-    fn set_#{field}_from_parsed(
-        g: &#{global_name},
-        parsed: &IdTableParsed,
-        path: &str,
-    ) -> Result<(), String> {
-        #{extract_expr}
-        #{model_expr}
-        g.set_#{field}(slint::ModelRc::new(model));
-        Ok(())
-    }
-
-    fn set_#{field}_default(g: &#{global_name}) {
-        g.set_#{field}(#{default_literal});
-    }
-    """
-  end
-
-  defp render_field_helper(
-         %{
-           name: name,
-           opts: opts,
-           default: default,
-           source: %{kind: :component_id_table, component: _component, root: _root, role: role}
-         },
-         global_name
-       ) do
-    field = Atom.to_string(name)
-    default_literal = rust_literal(:list, default, opts)
-    extract_expr = rust_id_table_extract_expr(role, opts)
-    model_expr = rust_list_model_from_values_expr(opts, "values", "path")
-
-    """
-    fn set_#{field}_from_parsed(
-        g: &#{global_name},
-        parsed: &IdTableParsed,
-        path: &str,
-    ) -> Result<(), String> {
-        #{extract_expr}
-        #{model_expr}
-        g.set_#{field}(slint::ModelRc::new(model));
-        Ok(())
-    }
-
-    fn set_#{field}_default(g: &#{global_name}) {
-        g.set_#{field}(#{default_literal});
-    }
-    """
-  end
-
   defp render_patch_apply_line(field) do
     condition = rust_patch_match_condition(field)
     target = Atom.to_string(field.name)
@@ -1304,7 +1210,11 @@ defmodule Mix.Tasks.Projection.Codegen do
     """
   end
 
-  defp render_component_root_patch_apply_line(component, direct_group, id_table_group) do
+  defp render_component_root_patch_apply_line(
+         component,
+         direct_group,
+         id_table_struct_group
+       ) do
     component_name = Atom.to_string(component)
     component_vm = component_vm_var(component)
 
@@ -1314,14 +1224,14 @@ defmodule Mix.Tasks.Projection.Codegen do
         "                      set_#{field.name}_from_component(&g, #{component_vm})?;"
       end)
 
-    id_table_setters =
-      id_table_group
-      |> Enum.map_join("\n", fn {{_component, root}, _fields} ->
-        "                      apply_component_id_table_#{component}_#{root}_from_component(&g, #{component_vm})?;"
+    id_table_struct_setters =
+      id_table_struct_group
+      |> Enum.map_join("\n", fn field ->
+        "                      apply_id_table_struct_#{field.name}_from_component(&g, #{component_vm})?;"
       end)
 
     setters =
-      [direct_setters, id_table_setters]
+      [direct_setters, id_table_struct_setters]
       |> Enum.reject(&(&1 == ""))
       |> Enum.join("\n")
 
@@ -1333,7 +1243,11 @@ defmodule Mix.Tasks.Projection.Codegen do
     """
   end
 
-  defp render_component_root_remove_apply_line(component, direct_group, id_table_group) do
+  defp render_component_root_remove_apply_line(
+         component,
+         direct_group,
+         id_table_struct_group
+       ) do
     component_name = Atom.to_string(component)
 
     direct_defaults =
@@ -1342,14 +1256,14 @@ defmodule Mix.Tasks.Projection.Codegen do
         "                      set_#{field.name}_default(&g);"
       end)
 
-    id_table_defaults =
-      id_table_group
-      |> Enum.map_join("\n", fn {{_component, root}, _fields} ->
-        "                      apply_component_id_table_#{component}_#{root}_from_component(&g, None)?;"
+    id_table_struct_defaults =
+      id_table_struct_group
+      |> Enum.map_join("\n", fn field ->
+        "                      apply_id_table_struct_#{field.name}_from_component(&g, None)?;"
       end)
 
     defaults =
-      [direct_defaults, id_table_defaults]
+      [direct_defaults, id_table_struct_defaults]
       |> Enum.reject(&(&1 == ""))
       |> Enum.join("\n")
 
@@ -1360,29 +1274,31 @@ defmodule Mix.Tasks.Projection.Codegen do
     """
   end
 
-  defp render_id_table_patch_apply_line({root, _fields}) do
-    root_name = Atom.to_string(root)
-    condition = rust_id_table_root_patch_match_condition(root)
+  defp render_id_table_struct_patch_apply_line(field) do
+    root_name = Atom.to_string(field.source.root)
+    condition = rust_id_table_root_patch_match_condition(field.source.root)
 
     """
                       if #{condition} {
-                          apply_id_table_#{root_name}_from_vm(&g, screen_vm)?;
+                          apply_id_table_struct_#{root_name}_from_vm(&g, screen_vm)?;
                       }
     """
   end
 
-  defp render_id_table_remove_apply_line({root, _fields}) do
-    root_name = Atom.to_string(root)
-    condition = rust_id_table_root_patch_match_condition(root)
+  defp render_id_table_struct_remove_apply_line(field) do
+    root_name = Atom.to_string(field.source.root)
+    condition = rust_id_table_root_patch_match_condition(field.source.root)
 
     """
                       if #{condition} {
-                          apply_id_table_#{root_name}_from_vm(&g, screen_vm)?;
+                          g.set_#{root_name}(slint::ModelRc::default());
                       }
     """
   end
 
-  defp render_component_id_table_patch_apply_line({{component, root}, _fields}) do
+  defp render_component_id_table_struct_patch_apply_line(field) do
+    component = field.source.component
+    root = field.source.root
     component_name = Atom.to_string(component)
     root_name = Atom.to_string(root)
     condition = rust_component_id_table_patch_match_condition(component, root)
@@ -1394,24 +1310,20 @@ defmodule Mix.Tasks.Projection.Codegen do
                               screen_vm
                                   .and_then(|root| root.get("#{component_name}"))
                                   .and_then(Value::as_object);
-                          apply_component_id_table_#{component_name}_#{root_name}_from_component(&g, #{component_vm})?;
+                          apply_id_table_struct_#{component_name}_#{root_name}_from_component(&g, #{component_vm})?;
                       }
     """
   end
 
-  defp render_component_id_table_remove_apply_line({{component, root}, _fields}) do
-    component_name = Atom.to_string(component)
-    root_name = Atom.to_string(root)
-    condition = rust_component_id_table_patch_match_condition(component, root)
-    component_vm = component_vm_var(component)
+  defp render_component_id_table_struct_remove_apply_line(field) do
+    condition =
+      rust_component_id_table_patch_match_condition(field.source.component, field.source.root)
+
+    field_name = Atom.to_string(field.name)
 
     """
                       if #{condition} {
-                          let #{component_vm} =
-                              screen_vm
-                                  .and_then(|root| root.get("#{component_name}"))
-                                  .and_then(Value::as_object);
-                          apply_component_id_table_#{component_name}_#{root_name}_from_component(&g, #{component_vm})?;
+                          g.set_#{field_name}(slint::ModelRc::default());
                       }
     """
   end
@@ -1446,117 +1358,113 @@ defmodule Mix.Tasks.Projection.Codegen do
     "field_path == \"#{top_path}\" || field_path.starts_with(\"#{top_path}/\")"
   end
 
-  defp rust_id_table_extract_expr(:ids, _opts) do
-    """
-    let _ = path;
-    let values = parsed.ids.clone();
-    """
-  end
-
-  defp rust_id_table_extract_expr({:column, column}, opts) do
-    column_name = Atom.to_string(column)
-    parse_fn = rust_list_parse_fn(opts)
+  defp render_id_table_struct_root_helper(field, global_name) do
+    root_name = Atom.to_string(field.source.root)
+    struct_type = "crate::#{field.struct_name}"
+    column_assignments = render_rust_struct_column_assignments(field.columns)
 
     """
-    let raw_values = match parsed.columns.get("#{column_name}") {
-        Some(v) => v.clone(),
-        None if parsed.ids.is_empty() => Vec::new(),
-        None => return Err(format!("missing id_table column '#{column_name}'")),
-    };
-    if raw_values.len() != parsed.ids.len() {
-        return Err(format!(
-            "inconsistent id_table column '#{column_name}' length: expected {}, got {}",
-            parsed.ids.len(),
-            raw_values.len()
-        ));
-    }
-    let values = #{parse_fn}(&Value::Array(raw_values), &format!("{path}/#{column_name}"))?;
-    """
-  end
-
-  defp render_id_table_root_helper(root, fields, global_name) do
-    root_name = Atom.to_string(root)
-
-    parsed_setters =
-      fields
-      |> Enum.map_join("\n", fn field ->
-        "    set_#{field.name}_from_parsed(g, &parsed, path)?;"
-      end)
-
-    defaults =
-      fields
-      |> Enum.map_join("\n", fn field ->
-        "    set_#{field.name}_default(g);"
-      end)
-
-    """
-    fn apply_id_table_#{root_name}_from_vm(
+    fn apply_id_table_struct_#{root_name}_from_vm(
         g: &#{global_name},
         screen_vm: Option<&serde_json::Map<String, Value>>,
     ) -> Result<(), String> {
         if let Some(value) = screen_vm.and_then(|root| root.get("#{root_name}")) {
-            return apply_id_table_#{root_name}_from_value(g, value, "/screen/vm/#{root_name}");
+            return apply_id_table_struct_#{root_name}_from_value(g, value, "/screen/vm/#{root_name}");
         }
 
-    #{defaults}
+        g.set_#{root_name}(slint::ModelRc::default());
         Ok(())
     }
 
-    fn apply_id_table_#{root_name}_from_value(
+    fn apply_id_table_struct_#{root_name}_from_value(
         g: &#{global_name},
         value: &Value,
         path: &str,
     ) -> Result<(), String> {
         let parsed = parse_id_table(value, path)?;
-    #{parsed_setters}
+        let mut rows: Vec<#{struct_type}> = Vec::with_capacity(parsed.ids.len());
+
+        for (index, id) in parsed.ids.iter().enumerate() {
+            rows.push(#{struct_type} {
+                r#id: id.clone().into(),
+    #{column_assignments}
+            });
+        }
+
+        g.set_#{root_name}(slint::ModelRc::new(slint::VecModel::from(rows)));
         Ok(())
     }
     """
   end
 
-  defp render_component_id_table_root_helper({component, root}, fields, global_name) do
-    component_name = Atom.to_string(component)
-    root_name = Atom.to_string(root)
-
-    parsed_setters =
-      fields
-      |> Enum.map_join("\n", fn field ->
-        "    set_#{field.name}_from_parsed(g, &parsed, path)?;"
-      end)
-
-    defaults =
-      fields
-      |> Enum.map_join("\n", fn field ->
-        "    set_#{field.name}_default(g);"
-      end)
+  defp render_component_id_table_struct_root_helper(field, global_name) do
+    component_name = Atom.to_string(field.source.component)
+    root_name = Atom.to_string(field.source.root)
+    field_name = Atom.to_string(field.name)
+    struct_type = "crate::#{field.struct_name}"
+    column_assignments = render_rust_struct_column_assignments(field.columns)
 
     """
-    fn apply_component_id_table_#{component_name}_#{root_name}_from_component(
+    fn apply_id_table_struct_#{field_name}_from_component(
         g: &#{global_name},
         component_vm: Option<&serde_json::Map<String, Value>>,
     ) -> Result<(), String> {
         if let Some(value) = component_vm.and_then(|root| root.get("#{root_name}")) {
-            return apply_component_id_table_#{component_name}_#{root_name}_from_value(
+            return apply_id_table_struct_#{field_name}_from_value(
                 g,
                 value,
                 "/screen/vm/#{component_name}/#{root_name}",
             );
         }
 
-    #{defaults}
+        g.set_#{field_name}(slint::ModelRc::default());
         Ok(())
     }
 
-    fn apply_component_id_table_#{component_name}_#{root_name}_from_value(
+    fn apply_id_table_struct_#{field_name}_from_value(
         g: &#{global_name},
         value: &Value,
         path: &str,
     ) -> Result<(), String> {
         let parsed = parse_id_table(value, path)?;
-    #{parsed_setters}
+        let mut rows: Vec<#{struct_type}> = Vec::with_capacity(parsed.ids.len());
+
+        for (index, id) in parsed.ids.iter().enumerate() {
+            rows.push(#{struct_type} {
+                r#id: id.clone().into(),
+    #{column_assignments}
+            });
+        }
+
+        g.set_#{field_name}(slint::ModelRc::new(slint::VecModel::from(rows)));
         Ok(())
     }
     """
+  end
+
+  defp render_rust_struct_column_assignments(columns) do
+    columns
+    |> Enum.map_join("\n", fn %{name: col_name, type: col_type} ->
+      col = Atom.to_string(col_name)
+      extract = rust_struct_column_extract(col, col_type)
+      "            r##{col}: #{extract},"
+    end)
+  end
+
+  defp rust_struct_column_extract(col_name, :string) do
+    "parsed.columns.get(\"#{col_name}\").and_then(|v| v.get(index)).and_then(Value::as_str).unwrap_or_default().into()"
+  end
+
+  defp rust_struct_column_extract(col_name, :integer) do
+    "parsed.columns.get(\"#{col_name}\").and_then(|v| v.get(index)).and_then(Value::as_i64).unwrap_or_default() as i32"
+  end
+
+  defp rust_struct_column_extract(col_name, :float) do
+    "parsed.columns.get(\"#{col_name}\").and_then(|v| v.get(index)).and_then(Value::as_f64).unwrap_or_default() as f32"
+  end
+
+  defp rust_struct_column_extract(col_name, :bool) do
+    "parsed.columns.get(\"#{col_name}\").and_then(|v| v.get(index)).and_then(Value::as_bool).unwrap_or_default()"
   end
 
   defp rust_set_value_expr(name, :string, setter_target) do
@@ -1837,20 +1745,64 @@ defmodule Mix.Tasks.Projection.Codegen do
     """
   end
 
-  defp render_screen_state_slint(spec) do
+  defp render_screen_state_slint(spec, ui_root_from_generated) do
+    struct_fields = Enum.filter(spec.fields, &(&1.type == :id_table_struct))
+
+    struct_import =
+      if struct_fields == [] do
+        ""
+      else
+        struct_names = Enum.map_join(struct_fields, ", ", & &1.struct_name)
+
+        "import { #{struct_names} } from \"#{ui_root_from_generated}/types.slint\";\n\n"
+      end
+
     property_lines =
       spec.fields
-      |> Enum.map_join("\n", fn field ->
-        opts = Map.get(field, :opts, [])
+      |> Enum.map_join("\n", fn
+        %{type: :id_table_struct, name: name, struct_name: struct_name} ->
+          "    in property <[#{struct_name}]> #{name}: [];"
 
-        "    in property <#{slint_type(field.type, opts)}> #{field.name}: #{slint_literal(field.type, field.default, opts)};"
+        field ->
+          opts = Map.get(field, :opts, [])
+
+          "    in property <#{slint_type(field.type, opts)}> #{field.name}: #{slint_literal(field.type, field.default, opts)};"
       end)
 
     """
     // generated by mix projection.codegen; do not edit manually
-    export global #{spec.global_name} {
+    #{struct_import}export global #{spec.global_name} {
     #{property_lines}
     }
+    """
+  end
+
+  defp render_slint_struct_definition(%{struct_name: struct_name, columns: columns}) do
+    column_lines =
+      columns
+      |> Enum.map_join("\n", fn %{name: col_name, type: col_type} ->
+        "    #{col_name}: #{slint_type(col_type, [])},"
+      end)
+
+    """
+    export struct #{struct_name} {
+        id: string,
+    #{column_lines}
+    }\
+    """
+  end
+
+  defp render_projection_types_slint(specs) do
+    struct_definitions =
+      specs
+      |> Enum.flat_map(fn spec ->
+        Enum.filter(spec.fields, &(&1.type == :id_table_struct))
+      end)
+      |> Enum.map_join("\n\n", &render_slint_struct_definition/1)
+
+    """
+    // generated by mix projection.codegen; do not edit manually
+    #{struct_definitions}
     """
   end
 
@@ -2154,40 +2106,6 @@ defmodule Mix.Tasks.Projection.Codegen do
     raise ArgumentError,
           "invalid id_table column metadata for codegen: #{inspect(column)}"
   end
-
-  defp id_table_column_values(%{order: order, by_id: by_id}, %{name: column, type: column_type})
-       when is_list(order) and is_map(by_id) and is_atom(column) and
-              column_type in [:string, :integer, :float, :bool] do
-    Enum.map(order, fn id ->
-      row = Map.get(by_id, id, %{})
-
-      value =
-        cond do
-          is_map(row) and Map.has_key?(row, column) ->
-            Map.get(row, column)
-
-          is_map(row) and Map.has_key?(row, Atom.to_string(column)) ->
-            Map.get(row, Atom.to_string(column))
-
-          true ->
-            nil
-        end
-
-      normalize_id_table_column_value(value, column_type)
-    end)
-  end
-
-  defp id_table_column_values(_default, _column), do: []
-
-  defp normalize_id_table_column_value(value, :string) when is_binary(value), do: value
-  defp normalize_id_table_column_value(value, :integer) when is_integer(value), do: value
-  defp normalize_id_table_column_value(value, :float) when is_float(value), do: value
-  defp normalize_id_table_column_value(value, :bool) when is_boolean(value), do: value
-
-  defp normalize_id_table_column_value(_value, :string), do: ""
-  defp normalize_id_table_column_value(_value, :integer), do: 0
-  defp normalize_id_table_column_value(_value, :float), do: 0.0
-  defp normalize_id_table_column_value(_value, :bool), do: false
 
   defp render_screen_host_route_branch(route, spec) do
     route_id = slint_identifier(route.route_key)

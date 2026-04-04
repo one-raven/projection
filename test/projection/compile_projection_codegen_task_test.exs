@@ -119,7 +119,7 @@ defmodule Projection.CompileProjectionCodegenTaskTest do
     assert screen_rs =~ "let model = slint::VecModel::from(parsed);"
   end
 
-  test "projection.codegen emits typed id_table column bindings" do
+  test "projection.codegen emits struct-based id_table bindings" do
     module_name = :"TypedIdTableScreen#{System.unique_integer([:positive])}"
     module = Module.concat([Projection, module_name])
 
@@ -160,18 +160,86 @@ defmodule Projection.CompileProjectionCodegenTaskTest do
       |> List.last()
       |> Macro.underscore()
 
+    # Types file: struct definitions live in types.slint
+    types_slint = File.read!(Path.join(configured_ui_root(), "types.slint"))
+    assert types_slint =~ "export struct DevicesRow {"
+    assert types_slint =~ "id: string,"
+    assert types_slint =~ "name: string,"
+    assert types_slint =~ "pos: int,"
+    assert types_slint =~ "load: float,"
+    assert types_slint =~ "online: bool,"
+
+    # State file: imports struct and declares single model property
     state_slint = File.read!("slint/ui_host/src/generated/#{screen_name}_state.slint")
-    assert state_slint =~ "in property <[string]> devices_ids: [\"dev-1\", \"dev-2\"];"
-    assert state_slint =~ "in property <[string]> devices_name: [\"A\", \"B\"];"
-    assert state_slint =~ "in property <[int]> devices_pos: [1, 2];"
-    assert state_slint =~ ~r/in property <\[float\]> devices_load: \[0\.5, (1|1\.0)\];/
-    assert state_slint =~ "in property <[bool]> devices_online: [true, false];"
+    assert state_slint =~ "import { DevicesRow } from"
+    assert state_slint =~ "in property <[DevicesRow]> devices: [];"
+
+    # No parallel arrays
+    refute state_slint =~ "devices_ids"
+    refute state_slint =~ "devices_name"
+
+    # Rust: struct-based construction from parsed id_table
+    screen_rs = File.read!("slint/ui_host/src/generated/#{screen_name}.rs")
+    assert screen_rs =~ "parse_id_table(value, path)"
+    assert screen_rs =~ "crate::DevicesRow {"
+    assert screen_rs =~ "id: id.clone().into(),"
+    assert screen_rs =~ ~s[parsed.columns.get("name")]
+    assert screen_rs =~ ~s[parsed.columns.get("pos")]
+    assert screen_rs =~ ~s[parsed.columns.get("load")]
+    assert screen_rs =~ ~s[parsed.columns.get("online")]
+  end
+
+  test "projection.codegen emits multiple structs for multiple id_tables" do
+    module_name = :"MultiIdTableScreen#{System.unique_integer([:positive])}"
+    module = Module.concat([Projection, module_name])
+
+    source = """
+    defmodule #{inspect(module)} do
+      use ProjectionUI, :screen
+
+      schema do
+        field(:devices, :id_table,
+          columns: [name: :string, status: :string],
+          default: %{order: [], by_id: %{}}
+        )
+        field(:sensors, :id_table,
+          columns: [label: :string, value: :float],
+          default: %{order: [], by_id: %{}}
+        )
+      end
+
+      @impl true
+      def render(assigns), do: assigns
+    end
+    """
+
+    Code.compile_string(source)
+
+    cleanup = setup_codegen_env(router_module: :delete, screen_modules: [module])
+    on_exit(cleanup)
+
+    capture_io(fn ->
+      Mix.Tasks.Projection.Codegen.run([])
+    end)
+
+    screen_name =
+      module
+      |> Module.split()
+      |> List.last()
+      |> Macro.underscore()
+
+    types_slint = File.read!(Path.join(configured_ui_root(), "types.slint"))
+    assert types_slint =~ "export struct DevicesRow {"
+    assert types_slint =~ "export struct SensorsRow {"
+
+    state_slint = File.read!("slint/ui_host/src/generated/#{screen_name}_state.slint")
+    assert state_slint =~ "import { DevicesRow, SensorsRow } from"
+    assert state_slint =~ "in property <[DevicesRow]> devices: [];"
+    assert state_slint =~ "in property <[SensorsRow]> sensors: [];"
 
     screen_rs = File.read!("slint/ui_host/src/generated/#{screen_name}.rs")
-    assert screen_rs =~ "columns: std::collections::BTreeMap<String, Vec<Value>>"
-    assert screen_rs =~ "parse_integer_list(&Value::Array(raw_values)"
-    assert screen_rs =~ "parse_float_list(&Value::Array(raw_values)"
-    assert screen_rs =~ "parse_bool_list(&Value::Array(raw_values)"
+    assert screen_rs =~ "crate::DevicesRow {"
+    assert screen_rs =~ "crate::SensorsRow {"
   end
 
   test "projection.codegen maps aliased route names to the referenced screen id" do
