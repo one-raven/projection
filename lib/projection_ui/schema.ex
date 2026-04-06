@@ -64,9 +64,9 @@ defmodule ProjectionUI.Schema do
   single `[Struct]` model property. For example, a field named `:devices` with
   `columns: [name: :string, online: :bool]` generates a `DevicesRow` struct
   with `id`, `name`, and `online` fields, and a property `<[DevicesRow]> devices`.
-  Screen `.slint` files import the struct from the generated per-screen
-  types file (e.g., `import { DevicesRow } from "home_types.slint"`)
-  and declare `in property <[DevicesRow]> devices: [];`.
+  Screen `.slint` files import the struct by filename alone (e.g.,
+  `import { DevicesRow } from "home_types.slint"`) and declare
+  `in property <[DevicesRow]> devices: [];`.
 
   ## Example
 

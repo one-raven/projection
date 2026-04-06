@@ -12,8 +12,8 @@ defmodule Mix.Tasks.Projection.Codegen do
     * `<screen>_state.slint` — Slint global with typed properties for each field.
       `:id_table` fields produce an `export struct <Name>Row` and a single
       `[<Name>Row]` model property. Struct definitions are also written to
-      `types/<screen>_types.slint` in the ui_root for screen file imports.
-      The `types/` directory is added to the Slint include path in `build.rs`.
+      `<screen>_types.slint` in the generated directory for screen file imports.
+      The generated directory is added to the Slint include path in `build.rs`.
     * `<screen>.rs` — Rust module with `apply_render` and `apply_patch` functions
       that map JSON values to Slint property setters.
 
@@ -55,9 +55,6 @@ defmodule Mix.Tasks.Projection.Codegen do
     generated_dir = Path.join(File.cwd!(), "slint/ui_host/src/generated")
     File.mkdir_p!(generated_dir)
 
-    types_dir = Path.join([File.cwd!(), ui_root, "types"])
-    File.mkdir_p!(types_dir)
-
     screen_results =
       specs
       |> Task.async_stream(
@@ -76,7 +73,7 @@ defmodule Mix.Tasks.Projection.Codegen do
 
           types =
             write_file_if_changed(
-              Path.join(types_dir, spec.types_file),
+              Path.join(generated_dir, spec.types_file),
               render_screen_types_slint(spec)
             )
 
@@ -683,7 +680,8 @@ defmodule Mix.Tasks.Projection.Codegen do
         ] ++
           app_state_files ++
           Enum.map(specs, &"#{&1.file_name}.rs") ++
-          Enum.map(specs, & &1.state_file)
+          Enum.map(specs, & &1.state_file) ++
+          Enum.map(specs, & &1.types_file)
       )
 
     generated_dir
@@ -2003,12 +2001,10 @@ defmodule Mix.Tasks.Projection.Codegen do
         []
       end
 
-    types_include_path = "#{ui_root_from_ui_host}/types"
-
     base_lines = [
       "fn main() {",
       "    let config = slint_build::CompilerConfiguration::new()",
-      "        .with_include_paths(vec![\"#{types_include_path}\".into()]);",
+      "        .with_include_paths(vec![\"src/generated\".into()]);",
       "    slint_build::compile_with_config(\"src/generated/app.slint\", config).expect(\"failed to compile app.slint\");",
       "",
       "    println!(\"cargo:rerun-if-changed=src/generated/app.slint\");",
@@ -2020,11 +2016,7 @@ defmodule Mix.Tasks.Projection.Codegen do
     (base_lines ++
        state_rerun_lines ++
        app_state_rerun_lines ++
-       [
-         "    println!(\"cargo:rerun-if-changed=#{ui_root_from_ui_host}/\");",
-         "    println!(\"cargo:rerun-if-changed=#{types_include_path}/\");",
-         "}"
-       ])
+       ["    println!(\"cargo:rerun-if-changed=#{ui_root_from_ui_host}/\");", "}"])
     |> Enum.join("\n")
     |> Kernel.<>("\n")
   end

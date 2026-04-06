@@ -568,10 +568,10 @@ export global DevicesState {
 }
 ```
 
-Codegen also generates per-screen types files in a `types/` subdirectory
-under your ui_root (e.g., `types/home_types.slint`, `types/devices_types.slint`).
-The `types/` directory is added to the Slint include path in `build.rs`,
-so your screen files can import by filename alone:
+Codegen also generates per-screen types files in the generated directory
+(e.g., `home_types.slint`, `devices_types.slint`). The generated directory
+is added to the Slint include path in `build.rs`, so your screen files
+can import by filename alone:
 
 ```slint
 import { DevicesRow } from "home_types.slint";
