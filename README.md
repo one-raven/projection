@@ -568,12 +568,13 @@ export global DevicesState {
 }
 ```
 
-Codegen also generates a `types.slint` file in your ui_root containing
-all struct definitions. Import the struct type in your screen file and declare
-the model as an `in property`:
+Codegen also generates per-screen types files in a `types/` subdirectory
+under your ui_root (e.g., `types/home_types.slint`, `types/devices_types.slint`).
+The `types/` directory is added to the Slint include path in `build.rs`,
+so your screen files can import by filename alone:
 
 ```slint
-import { DevicesRow } from "types.slint";
+import { DevicesRow } from "home_types.slint";
 
 export component RoomsScreen inherits Screen {
     in property <[DevicesRow]> devices: [];

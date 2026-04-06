@@ -12,7 +12,8 @@ defmodule Mix.Tasks.Projection.Codegen do
     * `<screen>_state.slint` — Slint global with typed properties for each field.
       `:id_table` fields produce an `export struct <Name>Row` and a single
       `[<Name>Row]` model property. Struct definitions are also written to
-      `types.slint` in the ui_root for screen file imports.
+      `types/<screen>_types.slint` in the ui_root for screen file imports.
+      The `types/` directory is added to the Slint include path in `build.rs`.
     * `<screen>.rs` — Rust module with `apply_render` and `apply_patch` functions
       that map JSON values to Slint property setters.
 
@@ -54,6 +55,9 @@ defmodule Mix.Tasks.Projection.Codegen do
     generated_dir = Path.join(File.cwd!(), "slint/ui_host/src/generated")
     File.mkdir_p!(generated_dir)
 
+    types_dir = Path.join([File.cwd!(), ui_root, "types"])
+    File.mkdir_p!(types_dir)
+
     screen_results =
       specs
       |> Task.async_stream(
@@ -67,10 +71,16 @@ defmodule Mix.Tasks.Projection.Codegen do
           slint =
             write_file_if_changed(
               Path.join(generated_dir, spec.state_file),
-              render_screen_state_slint(spec, ui_root_from_generated)
+              render_screen_state_slint(spec)
             )
 
-          {rs, slint}
+          types =
+            write_file_if_changed(
+              Path.join(types_dir, spec.types_file),
+              render_screen_types_slint(spec)
+            )
+
+          {rs, slint, types}
         end,
         ordered: false,
         timeout: codegen_task_timeout(),
@@ -78,7 +88,11 @@ defmodule Mix.Tasks.Projection.Codegen do
       )
       |> Enum.map(&unwrap_task_result!/1)
 
-    {screen_rs_results, screen_slint_results} = Enum.unzip(screen_results)
+    {screen_rs_results, screen_slint_results, screen_types_results} =
+      Enum.reduce(screen_results, {[], [], []}, fn {rs, slint, types},
+                                                   {rs_acc, slint_acc, types_acc} ->
+        {[rs | rs_acc], [slint | slint_acc], [types | types_acc]}
+      end)
 
     app_state_results =
       if app_spec do
@@ -123,12 +137,6 @@ defmodule Mix.Tasks.Projection.Codegen do
         render_error_state_slint()
       )
 
-    types_result =
-      write_file_if_changed(
-        Path.join(File.cwd!(), Path.join(ui_root, "types.slint")),
-        render_projection_types_slint(specs)
-      )
-
     build_rs_result =
       write_file_if_changed(
         Path.join(File.cwd!(), "slint/ui_host/build.rs"),
@@ -141,6 +149,7 @@ defmodule Mix.Tasks.Projection.Codegen do
       Enum.count(
         screen_rs_results ++
           screen_slint_results ++
+          screen_types_results ++
           app_state_results ++
           [
             mod_result,
@@ -148,7 +157,6 @@ defmodule Mix.Tasks.Projection.Codegen do
             screen_host_result,
             app_result,
             error_state_result,
-            types_result,
             build_rs_result
           ],
         fn
@@ -483,6 +491,7 @@ defmodule Mix.Tasks.Projection.Codegen do
       file_name: screen_name,
       fields: codegen_fields,
       global_name: camelize(screen_name) <> "State",
+      types_file: "#{screen_name}_types.slint",
       state_file: "#{screen_name}_state.slint"
     }
   end
@@ -1745,7 +1754,7 @@ defmodule Mix.Tasks.Projection.Codegen do
     """
   end
 
-  defp render_screen_state_slint(spec, ui_root_from_generated) do
+  defp render_screen_state_slint(spec) do
     struct_fields = Enum.filter(spec.fields, &(&1.type == :id_table_struct))
 
     struct_import =
@@ -1754,7 +1763,7 @@ defmodule Mix.Tasks.Projection.Codegen do
       else
         struct_names = Enum.map_join(struct_fields, ", ", & &1.struct_name)
 
-        "import { #{struct_names} } from \"#{ui_root_from_generated}/types.slint\";\n\n"
+        "import { #{struct_names} } from \"#{spec.types_file}\";\n\n"
       end
 
     property_lines =
@@ -1792,12 +1801,10 @@ defmodule Mix.Tasks.Projection.Codegen do
     """
   end
 
-  defp render_projection_types_slint(specs) do
+  defp render_screen_types_slint(spec) do
     struct_definitions =
-      specs
-      |> Enum.flat_map(fn spec ->
-        Enum.filter(spec.fields, &(&1.type == :id_table_struct))
-      end)
+      spec.fields
+      |> Enum.filter(&(&1.type == :id_table_struct))
       |> Enum.map_join("\n\n", &render_slint_struct_definition/1)
 
     """
@@ -1996,9 +2003,13 @@ defmodule Mix.Tasks.Projection.Codegen do
         []
       end
 
+    types_include_path = "#{ui_root_from_ui_host}/types"
+
     base_lines = [
       "fn main() {",
-      "    slint_build::compile(\"src/generated/app.slint\").expect(\"failed to compile app.slint\");",
+      "    let config = slint_build::CompilerConfiguration::new()",
+      "        .with_include_paths(vec![\"#{types_include_path}\".into()]);",
+      "    slint_build::compile_with_config(\"src/generated/app.slint\", config).expect(\"failed to compile app.slint\");",
       "",
       "    println!(\"cargo:rerun-if-changed=src/generated/app.slint\");",
       "    println!(\"cargo:rerun-if-changed=src/generated/screen_host.slint\");",
@@ -2009,7 +2020,11 @@ defmodule Mix.Tasks.Projection.Codegen do
     (base_lines ++
        state_rerun_lines ++
        app_state_rerun_lines ++
-       ["    println!(\"cargo:rerun-if-changed=#{ui_root_from_ui_host}/\");", "}"])
+       [
+         "    println!(\"cargo:rerun-if-changed=#{ui_root_from_ui_host}/\");",
+         "    println!(\"cargo:rerun-if-changed=#{types_include_path}/\");",
+         "}"
+       ])
     |> Enum.join("\n")
     |> Kernel.<>("\n")
   end
