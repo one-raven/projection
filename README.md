@@ -568,15 +568,13 @@ export global DevicesState {
 }
 ```
 
-Codegen also generates per-screen types files in the generated directory
-(e.g., `home_types.slint`, `devices_types.slint`). The generated directory
-is added to the Slint include path in `build.rs`, so your screen files
-can import by filename alone:
+In your screen `.slint` file, import the struct type and declare the model
+as an `in property`:
 
 ```slint
-import { DevicesRow } from "home_types.slint";
+import { DevicesRow } from "devices_types.slint";
 
-export component RoomsScreen inherits Screen {
+export component DevicesScreen inherits Screen {
     in property <[DevicesRow]> devices: [];
 
     for device[index] in root.devices: DeviceCard {
@@ -588,16 +586,49 @@ export component RoomsScreen inherits Screen {
 }
 ```
 
-The struct always includes an `id: string` field (from the id_table's `order` array)
-followed by one field per declared column, mapped to Slint types (`string`, `int`,
-`float`, `bool`).
+You can also store a whole row as a single property, which is useful for
+detail sheets or selected-item state:
+
+```slint
+property <DevicesRow> selected:
+    root.selected_index >= 0 ? root.devices[root.selected_index] : { };
+```
+
+### Naming conventions
 
 The struct name is derived from the field name: `devices` becomes `DevicesRow`,
-`sensor_readings` becomes `SensorReadingsRow`. The generated `screen_host.slint`
-passes the model to the screen as a property binding automatically.
+`sensor_readings` becomes `SensorReadingsRow`.
+
+The types file name matches the screen module's last segment (underscored),
+the same convention as the generated state files:
+
+| Screen module | Types file | State file |
+|---|---|---|
+| `MyApp.Screens.Home` | `home_types.slint` | `home_state.slint` |
+| `MyApp.Screens.Devices` | `devices_types.slint` | `devices_state.slint` |
+| `MyApp.Screens.DeviceDetail` | `device_detail_types.slint` | `device_detail_state.slint` |
+
+Types files are generated in `slint/ui_host/src/generated/` alongside the
+other generated files. The generated directory is added to the Slint include
+path in `build.rs`, so your screen files import by bare filename — no path
+prefix needed.
+
+### Struct fields
+
+The struct always includes an `id: string` field (from the id_table's `order`
+array) followed by one field per declared column, mapped to Slint types:
+
+| Elixir column type | Slint struct field type |
+|---|---|
+| `:string` | `string` |
+| `:integer` | `int` |
+| `:float` | `float` |
+| `:bool` | `bool` |
 
 On the Rust side, codegen generates a helper that parses the id_table JSON and
-constructs a `VecModel<Struct>` with one row per entry.
+constructs a `VecModel<Struct>` with one row per entry. The generated
+`screen_host.slint` passes the model to the screen as a property binding
+automatically.
 
 ## Define a screen
 
