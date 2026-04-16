@@ -2192,6 +2192,24 @@ defmodule Mix.Tasks.Projection.Codegen do
         ""
       end
 
+    # Consumers may declare additional Slint globals (e.g. Rust-owned state
+    # like QR code images, camera feeds, or hardware sensors) that aren't
+    # part of the screen schema. These get re-exported from the generated
+    # root so slint-build exposes them to Rust.
+    #
+    # Example config:
+    #   config :projection, slint_app_exports: [
+    #     {"QrState", "qr_state.slint"}
+    #   ]
+    extra_export_lines =
+      :projection
+      |> Application.get_env(:slint_app_exports, [])
+      |> Enum.map(fn {name, file} ->
+        "export { #{name} } from \"#{ui_root_from_generated}/#{file}\";"
+      end)
+      |> Enum.sort()
+      |> Enum.join("\n")
+
     # AppShell owns navigation chrome. Wire active_tab and navigate through the shell.
     shell_nav_props = """
             active_tab: root.active_screen;
@@ -2206,6 +2224,7 @@ defmodule Mix.Tasks.Projection.Codegen do
     #{state_export_lines}
     export { ErrorState } from "error_state.slint";
     #{app_state_export_line}
+    #{extra_export_lines}
 
     export component AppWindow inherits Window {
         in property <int> vm_rev: 0;
