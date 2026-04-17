@@ -1724,10 +1724,19 @@ defmodule Mix.Tasks.Projection.Codegen do
 
             ids.push(id);
 
+            // Ensure every known column gets a value for this row (even if
+            // the row doesn't have the key). This prevents misaligned column
+            // vectors when different rows have different sets of keys.
+            for col in columns.keys().cloned().collect::<Vec<_>>() {
+                if !row.contains_key(&col) {
+                    columns.get_mut(&col).unwrap().push(Value::Null);
+                }
+            }
+
             for (column, column_value) in row {
                 columns
                     .entry(column.clone())
-                    .or_insert_with(Vec::new)
+                    .or_insert_with(|| vec![Value::Null; index])
                     .push(column_value.clone());
             }
         }
