@@ -140,6 +140,12 @@ defmodule Mix.Tasks.Projection.Codegen do
         render_build_rs(specs, ui_root_from_ui_host, app_spec)
       )
 
+    # Hooks scaffolding: create the user-editable hooks module and ensure the
+    # Cargo build-dep is declared. Both operations are idempotent and never
+    # overwrite user content — they only fill in what's missing.
+    hooks_mod_result = ensure_hooks_mod_scaffold!()
+    cargo_toml_result = ensure_hook_build_dep!()
+
     removed_count = prune_stale_generated_files(generated_dir, specs, app_spec)
 
     written_count =
@@ -154,7 +160,9 @@ defmodule Mix.Tasks.Projection.Codegen do
             screen_host_result,
             app_result,
             error_state_result,
-            build_rs_result
+            build_rs_result,
+            hooks_mod_result,
+            cargo_toml_result
           ],
         fn
           :written -> true
@@ -637,6 +645,99 @@ defmodule Mix.Tasks.Projection.Codegen do
         File.write!(path, content)
         :written
     end
+  end
+
+  # Creates `slint/ui_host/src/hooks/mod.rs` with a starter template if it does
+  # not already exist. Users add `#[hook]` functions here; the file is never
+  # overwritten by codegen after initial creation.
+  defp ensure_hooks_mod_scaffold! do
+    path = Path.join(File.cwd!(), "slint/ui_host/src/hooks/mod.rs")
+
+    if File.exists?(path) do
+      :unchanged
+    else
+      File.mkdir_p!(Path.dirname(path))
+      File.write!(path, render_hooks_mod_scaffold())
+      :written
+    end
+  end
+
+  defp render_hooks_mod_scaffold do
+    """
+    //! User-authored Projection hooks.
+    //!
+    //! A `#[hook]` function is a pure Rust function Slint can invoke on a
+    //! background thread. The build-time scanner turns each hook into a Slint
+    //! global with `invoke(args...)`, `result`, `loading`, and `error`.
+    //!
+    //! See docs/hooks.md in the projection repo for the full guide.
+    //!
+    //! # Example
+    //!
+    //! ```ignore
+    //! use projection_ui_host_runtime::hook;
+    //! use slint::SharedString;
+    //!
+    //! #[hook]
+    //! pub fn uppercase(text: SharedString) -> SharedString {
+    //!     text.to_uppercase().into()
+    //! }
+    //! ```
+
+    #[allow(unused_imports)]
+    use projection_ui_host_runtime::hook;
+    """
+  end
+
+  # Ensures `projection_ui_host_codegen` is declared as a build-dependency in
+  # the app's `slint/ui_host/Cargo.toml`. Idempotent: inserts a `[build-dependencies]`
+  # section if missing and adds the path dep if absent; does not reorder or
+  # modify other keys.
+  defp ensure_hook_build_dep! do
+    path = Path.join(File.cwd!(), "slint/ui_host/Cargo.toml")
+
+    case File.read(path) do
+      {:ok, content} ->
+        updated = insert_hook_build_dep(content)
+
+        if updated == content do
+          :unchanged
+        else
+          File.write!(path, updated)
+          :written
+        end
+
+      {:error, _} ->
+        # No Cargo.toml yet — user hasn't set up the Rust host. Nothing to do.
+        :unchanged
+    end
+  end
+
+  @hook_build_dep_key "projection_ui_host_codegen"
+
+  defp insert_hook_build_dep(content) do
+    if String.contains?(content, @hook_build_dep_key) do
+      content
+    else
+      case Regex.run(~r/(?ms)^\[build-dependencies\]\s*\n/, content, return: :index) do
+        [{offset, length}] ->
+          header_end = offset + length
+          {before, rest} = String.split_at(content, header_end)
+          before <> hook_build_dep_line() <> rest
+
+        nil ->
+          # Append a new [build-dependencies] section at end-of-file.
+          trimmed = String.trim_trailing(content)
+
+          trimmed <>
+            "\n\n[build-dependencies]\n" <>
+            hook_build_dep_line()
+      end
+    end
+  end
+
+  defp hook_build_dep_line do
+    ~s(#{@hook_build_dep_key} = { path = "../ui_host_codegen" }\n)
   end
 
   defp unwrap_task_result!({:ok, status}), do: status
@@ -2011,10 +2112,25 @@ defmodule Mix.Tasks.Projection.Codegen do
       end
 
     base_lines = [
+      "use std::path::Path;",
+      "",
       "fn main() {",
+      "    // Scan user-authored hooks and emit Slint/Rust glue into generated_hooks/.",
+      "    // Hooks are opt-in — if src/hooks/mod.rs is absent, scan_and_emit is a no-op.",
+      "    let hooks_entry = Path::new(\"src/hooks/mod.rs\");",
+      "    let app_slint = Path::new(\"src/generated/app.slint\");",
+      "    let hooks_out = Path::new(\"src/generated_hooks\");",
+      "    let emit = projection_ui_host_codegen::scan_and_emit(hooks_entry, app_slint, hooks_out)",
+      "        .expect(\"hook codegen failed\");",
+      "    for path in &emit.scanned_files {",
+      "        println!(\"cargo:rerun-if-changed={}\", path.display());",
+      "    }",
+      "    println!(\"cargo:rerun-if-changed=src/hooks\");",
+      "",
       "    let config = slint_build::CompilerConfiguration::new()",
-      "        .with_include_paths(vec![\"src/generated\".into()]);",
-      "    slint_build::compile_with_config(\"src/generated/app.slint\", config).expect(\"failed to compile app.slint\");",
+      "        .with_include_paths(vec![\"src/generated\".into(), \"src/generated_hooks\".into()]);",
+      "    slint_build::compile_with_config(\"src/generated_hooks/root.slint\", config)",
+      "        .expect(\"failed to compile root.slint\");",
       "",
       "    println!(\"cargo:rerun-if-changed=src/generated/app.slint\");",
       "    println!(\"cargo:rerun-if-changed=src/generated/screen_host.slint\");",

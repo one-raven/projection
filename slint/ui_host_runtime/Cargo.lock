@@ -1263,9 +1263,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "projection_ui_host_macros"
+version = "0.1.0"
+
+[[package]]
 name = "projection_ui_host_runtime"
 version = "0.1.0"
 dependencies = [
+ "projection_ui_host_macros",
  "serde",
  "serde_json",
  "slint",

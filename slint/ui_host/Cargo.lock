@@ -3345,9 +3345,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "projection_ui_host_codegen"
+version = "0.1.0"
+dependencies = [
+ "syn",
+]
+
+[[package]]
+name = "projection_ui_host_macros"
+version = "0.1.0"
+
+[[package]]
 name = "projection_ui_host_runtime"
 version = "0.1.0"
 dependencies = [
+ "projection_ui_host_macros",
  "serde",
  "serde_json",
  "slint",
@@ -4572,6 +4584,7 @@ dependencies = [
 name = "ui_host"
 version = "0.1.0"
 dependencies = [
+ "projection_ui_host_codegen",
  "projection_ui_host_runtime",
  "serde_json",
  "slint",

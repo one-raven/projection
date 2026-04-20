@@ -280,7 +280,11 @@ defmodule Projection.CompileProjectionCodegenTaskTest do
     build_rs = File.read!("slint/ui_host/build.rs")
     assert build_rs =~ "compile_with_config"
     assert build_rs =~ "CompilerConfiguration"
-    assert build_rs =~ ~S|with_include_paths(vec!["src/generated".into()])|
+
+    assert build_rs =~
+             ~S|with_include_paths(vec!["src/generated".into(), "src/generated_hooks".into()])|
+
+    assert build_rs =~ "scan_and_emit"
   end
 
   test "projection.codegen maps aliased route names to the referenced screen id" do

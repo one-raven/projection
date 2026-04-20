@@ -22,6 +22,7 @@ This repository is the library core. It intentionally does not ship demo screens
 - Codegen (`mix projection.codegen`) for Rust/Slint typed bindings.
 - Shared Rust host runtime crate (`slint/ui_host_runtime`) used by app-local `ui_host` adapters.
 - Compile tasks (`mix compile.projection_codegen`, `mix compile.projection_ui_host`) that your app can opt into.
+- Hooks: pure Rust functions invokable from Slint on a background thread, for native work that doesn't need to cross the Elixir protocol. See [docs/hooks.md](docs/hooks.md).
 
 ## Architecture
 
@@ -66,6 +67,16 @@ The host bridges those loops through framed stdio messages.
 - `:id_table` fields require typed columns, for example `columns: [name: :string, pos: :integer]`.
 - Codegen generates a Slint `export struct` and `[Struct]` model property for each `:id_table` field (see below).
 - Generated bindings connect patch paths to concrete Slint property setters.
+
+### Hooks (native Rust extensions)
+
+For work that shouldn't cross the Elixir protocol — generating a QR code from a URL, decoding a barcode, fast local validation — Projection supports hooks: pure Rust functions annotated with `#[hook]` that Slint can invoke on a background thread.
+
+A hook named `qr_image(url: SharedString) -> Image` becomes the Slint global `QrImageHook` with `invoke(url)`, `result`, `loading`, and `error`. Elixir is not involved and does not know hooks exist.
+
+Consumers write hooks in `slint/ui_host/src/hooks/mod.rs` (scaffolded on first `mix compile`). Everything else — Cargo build-dep, Slint re-export, `main.rs` wiring — is handled by Projection.
+
+See [docs/hooks.md](docs/hooks.md) for the full guide.
 
 ## Install
 
