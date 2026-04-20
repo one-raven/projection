@@ -140,6 +140,12 @@ defmodule Mix.Tasks.Projection.Codegen do
         render_build_rs(specs, ui_root_from_ui_host, app_spec)
       )
 
+    # Resolve projection's source directory (either a sibling path dep or
+    # deps/projection) and symlink it at a stable location inside the
+    # ui_host crate so Cargo `path = "..."` deps work identically across
+    # local dev, CI, and Docker firmware builds.
+    ensure_projection_symlink!()
+
     # Hooks scaffolding: create the user-editable hooks module and ensure the
     # Cargo build-dep is declared. Both operations are idempotent and never
     # overwrite user content — they only fill in what's missing.
@@ -737,7 +743,50 @@ defmodule Mix.Tasks.Projection.Codegen do
   end
 
   defp hook_build_dep_line do
-    ~s(#{@hook_build_dep_key} = { path = "../ui_host_codegen" }\n)
+    ~s(#{@hook_build_dep_key} = { path = ".projection/slint/ui_host_codegen" }\n)
+  end
+
+  # Creates `slint/ui_host/.projection` as a symlink to projection's source
+  # root, so the consuming crate's Cargo.toml can use a stable relative
+  # path like `.projection/slint/ui_host_codegen` regardless of whether
+  # projection was resolved as a sibling path dep or fetched into
+  # deps/projection (local dev, CI, Docker firmware builds all work).
+  defp ensure_projection_symlink! do
+    ui_host_dir = Path.join(File.cwd!(), "slint/ui_host")
+
+    unless File.dir?(ui_host_dir) do
+      :ok
+    else
+      case find_projection_source() do
+        nil ->
+          :ok
+
+        source ->
+          link = Path.join(ui_host_dir, ".projection")
+          target = Path.expand(source)
+
+          case File.read_link(link) do
+            {:ok, current} ->
+              if current == target do
+                :ok
+              else
+                File.rm(link)
+                File.ln_s!(target, link)
+              end
+
+            {:error, _} ->
+              if File.exists?(link), do: File.rm_rf!(link)
+              File.ln_s!(target, link)
+          end
+      end
+    end
+  end
+
+  defp find_projection_source do
+    case Map.get(Mix.Project.deps_paths(), :projection) do
+      nil -> nil
+      path -> if File.dir?(path), do: path, else: nil
+    end
   end
 
   defp unwrap_task_result!({:ok, status}), do: status
