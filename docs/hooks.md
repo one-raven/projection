@@ -102,6 +102,45 @@ changed HomeState.setup_url => { QrImageHook.invoke(HomeState.setup_url); }
 Image { source: QrImageHook.result; }
 ```
 
+### Triggering on load
+
+Use Slint's `init => { }` callback to fire a hook once when the view mounts.
+`init` runs exactly one time per component instance, after the component's
+properties have their initial values (including anything Elixir pushed in the
+first `render`).
+
+If the value never changes after load, `init` alone is enough:
+
+```slint
+init => { QrImageHook.invoke(root.setup_url); }
+Image { source: QrImageHook.result; }
+```
+
+If the value can change later, pair `init` with `changed` so the hook runs
+both on mount and on every subsequent update:
+
+```slint
+function refresh() { QrImageHook.invoke(root.setup_url); }
+init => { refresh(); }
+changed setup_url => { refresh(); }
+```
+
+**Gotcha: initial-value emptiness.** If the screen mounts before Elixir has
+pushed the real value — e.g. it's fetched asynchronously — `init` fires with
+whatever default the property has (usually `""`). Guard the call so the hook
+isn't invoked with garbage input:
+
+```slint
+init => {
+    if (root.setup_url != "") { QrImageHook.invoke(root.setup_url); }
+}
+```
+
+The `changed` block still picks up the real value when it arrives. Skipping
+`init` entirely and relying only on `changed` is not a reliable substitute:
+`changed` does not fire for the first value assignment if the property's
+initial value is already that same value.
+
 ## Lifecycle and guarantees
 
 - **Runs on a worker thread.** Every invocation calls `std::thread::spawn` and
