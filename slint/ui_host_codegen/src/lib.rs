@@ -29,6 +29,13 @@ pub struct Hook {
     pub global_name: String,
     pub inputs: Vec<HookInput>,
     pub output: SlintType,
+    /// Rust expression that converts the hook's return value (named
+    /// `value`) into the type needed to set the Slint property. For
+    /// direct `slint::Image` returns this is just `value`; for
+    /// `SharedPixelBuffer<Rgba8Pixel>` returns it wraps the buffer
+    /// with `from_rgba8_premultiplied` so the conversion happens on
+    /// the UI thread (the buffer is Send; slint::Image is not).
+    pub output_setter_expr: String,
     pub mode: HookMode,
 }
 
@@ -235,7 +242,7 @@ fn extract_hook(func: &ItemFn, mode: HookMode, path: &Path) -> Result<Hook, Stri
         });
     }
 
-    let output = match &func.sig.output {
+    let (output, output_setter_expr) = match &func.sig.output {
         ReturnType::Default => {
             return Err(format!(
                 "{}: hook `{}` must return a value (use `()`-like hooks are not supported)",
@@ -243,10 +250,11 @@ fn extract_hook(func: &ItemFn, mode: HookMode, path: &Path) -> Result<Hook, Stri
                 func.sig.ident
             ));
         }
-        ReturnType::Type(_, ty) => map_type(ty).ok_or_else(|| {
+        ReturnType::Type(_, ty) => map_output_type(ty).ok_or_else(|| {
             format!(
                 "{}: hook `{}` return type `{}` is unsupported. \
-                 Supported: SharedString, i32, i64, f32, f64, bool, slint::Image",
+                 Supported: SharedString, i32, i64, f32, f64, bool, slint::Image, \
+                 slint::SharedPixelBuffer<slint::Rgba8Pixel>",
                 path.display(),
                 func.sig.ident,
                 quote_type(ty),
@@ -262,8 +270,39 @@ fn extract_hook(func: &ItemFn, mode: HookMode, path: &Path) -> Result<Hook, Stri
         global_name,
         inputs,
         output,
+        output_setter_expr,
         mode,
     })
+}
+
+/// Map a Rust return type to `(SlintType, setter_expr)`. `setter_expr`
+/// is the Rust expression — with the hook's return value bound to
+/// `value` — that yields the type the Slint property expects.
+fn map_output_type(ty: &Type) -> Option<(SlintType, String)> {
+    if let Some(slint_ty) = map_type(ty) {
+        return Some((slint_ty, "value".to_string()));
+    }
+
+    // SharedPixelBuffer<Rgba8Pixel> → Slint `image`. Unlike slint::Image,
+    // the buffer is Send, so it can cross from the worker thread; we
+    // build the Image on the UI thread before setting the property.
+    let Type::Path(type_path) = ty else { return None; };
+    let last = type_path.path.segments.last()?;
+    if last.ident != "SharedPixelBuffer" {
+        return None;
+    }
+    let PathArguments::AngleBracketed(args) = &last.arguments else { return None; };
+    let inner = args.args.first()?;
+    let GenericArgument::Type(inner_ty) = inner else { return None; };
+    let Type::Path(inner_path) = inner_ty else { return None; };
+    let inner_last = inner_path.path.segments.last()?;
+    if inner_last.ident != "Rgba8Pixel" {
+        return None;
+    }
+    Some((
+        SlintType::Image,
+        "slint::Image::from_rgba8_premultiplied(value)".to_string(),
+    ))
 }
 
 fn map_type(ty: &Type) -> Option<SlintType> {
@@ -502,6 +541,7 @@ fn emit_register_rs(hooks: &[Hook]) -> String {
 fn emit_hook_binding(hook: &Hook) -> String {
     let global = &hook.global_name;
     let fn_name = &hook.fn_name;
+    let setter = &hook.output_setter_expr;
 
     let cb_params: Vec<String> = hook.inputs.iter().map(|i| i.name.clone()).collect();
     let cb_param_list = cb_params.join(", ");
@@ -538,7 +578,7 @@ fn register_{fn_name}(ui: &crate::AppWindow) {{
                 let g = ui.global::<crate::{global}>();
                 match result {{
                     Ok(value) => {{
-                        g.set_result(value);
+                        g.set_result({setter});
                         g.set_error(slint::SharedString::new());
                     }}
                     Err(payload) => {{

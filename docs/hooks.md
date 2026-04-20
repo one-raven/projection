@@ -36,6 +36,10 @@ Every hook is a `pub fn` in `slint/ui_host/src/hooks/mod.rs`, annotated with
 `#[hook]`. The signature is the whole contract — inputs, output type, and hook
 name (which becomes the Slint global name) are all derived from it.
 
+`mix compile` scaffolds `src/hooks/mod.rs` on first run (with a starter
+template); you never need to create the file yourself, and Projection never
+overwrites it after creation.
+
 ```rust
 // slint/ui_host/src/hooks/mod.rs
 use projection_ui_host_runtime::hook;
@@ -164,19 +168,22 @@ initial value is already that same value.
 
 To add a hook to a project:
 
-1. Add the function to `slint/ui_host/src/hooks/mod.rs` with `#[hook]`.
-2. Add any new Rust dependency the hook needs to `slint/ui_host/Cargo.toml`.
-3. Run `cargo build` (or `mix compile`). The scanner regenerates:
-   - `slint/ui_host/src/generated_hooks/hooks.slint` — the global
-   - `slint/ui_host/src/generated_hooks/root.slint` — Slint entry that
-     re-exports everything
-   - `slint/ui_host/src/generated_hooks/register.rs` — the Rust glue
-4. Import the generated global in your screen's `.slint` file:
-   `import { MyHook } from "hooks.slint";`
-5. Trigger it from Slint with `MyHook.invoke(...)` and read `MyHook.result`.
+1. Run `mix compile` at least once. Projection will scaffold
+   `slint/ui_host/src/hooks/mod.rs` and ensure the `projection_ui_host_codegen`
+   build-dep is declared in `slint/ui_host/Cargo.toml`. Both are idempotent
+   and never overwrite user content.
+2. Open `slint/ui_host/src/hooks/mod.rs` and add a `pub fn` annotated with
+   `#[hook]`.
+3. Add any new Rust crate the hook needs (e.g. `fast_qr`, `regex`) to
+   `slint/ui_host/Cargo.toml` under `[dependencies]`.
+4. Run `cargo build` (or `mix compile`). `build.rs` scans your hooks and
+   regenerates everything under `src/generated_hooks/`.
+5. In your screen's `.slint` file, `import { MyHook } from "hooks.slint";`
+   and use `MyHook.invoke(...)`, `MyHook.result`, etc.
 
-The `src/generated_hooks/` directory is gitignored; files are produced by
-`build.rs` on every build.
+Your `main.rs` stays untouched — Projection's `app_main!` macro already
+wires the generated register function in. The `src/generated_hooks/`
+directory is gitignored; files are produced by `build.rs` on every build.
 
 ## Constraints in the current version
 

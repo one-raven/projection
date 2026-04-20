@@ -834,9 +834,16 @@ fn parse_index(token: &str, max_len: usize, path: &str) -> Result<usize, String>
 #[macro_export]
 macro_rules! app_main {
     ($window:ty, $ui_global:ty, $error_global:ty, $generated:ident $(,)?) => {
-        $crate::app_main!($window, $ui_global, $error_global, $generated, |_ui: &$window| {});
-    };
-    ($window:ty, $ui_global:ty, $error_global:ty, $generated:ident, $hook_setup:expr $(,)?) => {
+        // Absorb the hook wiring so consumers never touch it. The scanner
+        // (invoked from build.rs) always emits `register.rs` — even when
+        // `src/hooks/mod.rs` defines zero hooks — so this include is always
+        // valid. Mix codegen scaffolds `src/hooks/mod.rs` on first run.
+        mod hooks;
+        #[allow(dead_code)]
+        mod __projection_hook_register {
+            include!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/generated_hooks/register.rs"));
+        }
+
         struct ProjectionRuntimeBindings;
 
         impl $crate::HostBindings for ProjectionRuntimeBindings {
@@ -934,8 +941,7 @@ macro_rules! app_main {
             }
 
             fn setup_hooks(ui: &Self::Ui) {
-                let setup: fn(&Self::Ui) = $hook_setup;
-                setup(ui);
+                __projection_hook_register::register_hooks(ui);
             }
         }
 

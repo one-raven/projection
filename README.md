@@ -74,6 +74,8 @@ For work that shouldn't cross the Elixir protocol — generating a QR code from 
 
 A hook named `qr_image(url: SharedString) -> Image` becomes the Slint global `QrImageHook` with `invoke(url)`, `result`, `loading`, and `error`. Elixir is not involved and does not know hooks exist.
 
+Consumers write hooks in `slint/ui_host/src/hooks/mod.rs` (scaffolded on first `mix compile`). Everything else — Cargo build-dep, Slint re-export, `main.rs` wiring — is handled by Projection.
+
 See [docs/hooks.md](docs/hooks.md) for the full guide.
 
 ## Install
