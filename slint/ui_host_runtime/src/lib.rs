@@ -1,5 +1,7 @@
 pub mod protocol;
 
+pub use projection_ui_host_macros::hook;
+
 use crate::protocol::{intent_envelope, reader_loop, ready_envelope, writer_loop};
 use serde_json::Value;
 use serde_json::json;
@@ -66,6 +68,21 @@ pub trait HostBindings {
     fn patch_changes_screen(path: &str) -> bool {
         path == "/screen/name"
     }
+
+    /// Wires up any generated hook bindings. The default is a no-op; the
+    /// `app_main!` macro overrides this when a hook-setup callback is provided.
+    fn setup_hooks(_ui: &Self::Ui) {}
+}
+
+/// Extract a user-visible message from a `catch_unwind` payload.
+pub fn hook_panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
+    if let Some(s) = payload.downcast_ref::<&'static str>() {
+        return (*s).to_string();
+    }
+    if let Some(s) = payload.downcast_ref::<String>() {
+        return s.clone();
+    }
+    "hook panicked".to_string()
 }
 
 #[derive(Debug, Clone)]
@@ -89,6 +106,7 @@ impl<ScreenId: Copy + Default> Default for UiModelState<ScreenId> {
 
 pub fn run<B: HostBindings>() -> Result<(), Box<dyn std::error::Error>> {
     let ui = B::new_ui()?;
+    B::setup_hooks(&ui);
     let ui_weak = ui.as_weak();
     let ui_model_state = Arc::new(Mutex::new(UiModelState::<B::ScreenId>::default()));
     let next_intent_id = Arc::new(AtomicU64::new(1));
@@ -815,7 +833,10 @@ fn parse_index(token: &str, max_len: usize, path: &str) -> Result<usize, String>
 
 #[macro_export]
 macro_rules! app_main {
-    ($window:ty, $ui_global:ty, $error_global:ty, $generated:ident) => {
+    ($window:ty, $ui_global:ty, $error_global:ty, $generated:ident $(,)?) => {
+        $crate::app_main!($window, $ui_global, $error_global, $generated, |_ui: &$window| {});
+    };
+    ($window:ty, $ui_global:ty, $error_global:ty, $generated:ident, $hook_setup:expr $(,)?) => {
         struct ProjectionRuntimeBindings;
 
         impl $crate::HostBindings for ProjectionRuntimeBindings {
@@ -910,6 +931,11 @@ macro_rules! app_main {
                 vm: &$crate::serde_json::Value,
             ) -> Result<(), String> {
                 $generated::apply_app_patch(ui, ops, vm)
+            }
+
+            fn setup_hooks(ui: &Self::Ui) {
+                let setup: fn(&Self::Ui) = $hook_setup;
+                setup(ui);
             }
         }
 
