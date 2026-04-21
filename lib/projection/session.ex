@@ -309,6 +309,17 @@ defmodule Projection.Session do
         emit_intent_received(state, name, ack)
         Logger.debug("ui intent received name=#{name} ack=#{inspect(ack)}")
 
+        # Stamp the arrival time BEFORE dispatching so `processed_in`
+        # captures mount/dispatch/effects and not just the tail-end
+        # patch enqueue → flush window. If we're already mid-batch,
+        # keep the earlier stamp.
+        state =
+          if is_nil(state.pending_ack_started_at) do
+            %{state | pending_ack_started_at: System.monotonic_time(:microsecond)}
+          else
+            state
+          end
+
         case maybe_handle_route_intent(name, payload, ack, state) do
           {:handled, next_state} ->
             {:ok, [], next_state}
