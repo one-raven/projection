@@ -6,10 +6,52 @@ use crate::protocol::{intent_envelope, reader_loop, ready_envelope, writer_loop}
 use serde_json::Value;
 use serde_json::json;
 use slint::ComponentHandle;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, SyncSender, TrySendError};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
+use std::time::Instant;
+
+/// Tracks intent send timestamps by intent id so we can compute the
+/// full round-trip latency (Rust → Elixir → Rust) when the
+/// corresponding patch returns with the matching ack.
+fn intent_rtt_map() -> &'static Mutex<HashMap<u64, Instant>> {
+    static MAP: OnceLock<Mutex<HashMap<u64, Instant>>> = OnceLock::new();
+    MAP.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn record_intent_sent(id: u64) {
+    if let Ok(mut m) = intent_rtt_map().lock() {
+        m.insert(id, Instant::now());
+    }
+}
+
+/// Returns the microseconds elapsed since the matching intent was
+/// sent, if any. Consumes the entry so memory stays bounded even if
+/// some intents never get acked (error patches, etc.).
+fn take_intent_rtt_us(ack: u64) -> Option<u128> {
+    let started = intent_rtt_map().lock().ok()?.remove(&ack)?;
+    Some(started.elapsed().as_micros())
+}
+
+/// Format a microsecond duration — sub-5ms stays in µs for precision,
+/// longer gets rounded to ms.
+fn fmt_us(us: u128) -> String {
+    if us >= 5_000 {
+        format!("{}ms", us / 1_000)
+    } else {
+        format!("{}µs", us)
+    }
+}
+
+/// Any user-visible UI round trip taking ≥100ms is almost always a
+/// regression; tag the log line so it stands out.
+const SLOW_US: u128 = 100_000;
+
+fn level_for(us: u128) -> &'static str {
+    if us >= SLOW_US { "[WARN]" } else { "[DEBUG]" }
+}
 
 pub use crate::protocol::{
     ELIXIR_TO_UI_CAP, ElixirEnvelope, PatchOp, UI_TO_ELIXIR_CAP, UiEnvelope,
@@ -204,6 +246,19 @@ pub fn run<B: HostBindings>() -> Result<(), Box<dyn std::error::Error>> {
                 });
             }
             ElixirEnvelope::Patch { sid, rev, ack, ops } => {
+                if let Some(ack_id) = ack {
+                    let rtt = take_intent_rtt_us(ack_id);
+                    let level = rtt.map(level_for).unwrap_or("[DEBUG]");
+                    eprint!(
+                        "\r{} [ui_host] patch received ack={} rev={} ops={} rtt={}\r\n",
+                        level,
+                        ack_id,
+                        rev,
+                        ops.len(),
+                        rtt.map(fmt_us).unwrap_or_else(|| "unknown".to_string()),
+                    );
+                }
+
                 let state_for_patch = shared_state.clone();
                 let tx_for_resync = resync_tx.clone();
                 let sid_for_resync = resync_sid.clone();
@@ -432,7 +487,10 @@ fn send_intent(
     let envelope = intent_envelope(sid, id, name.to_string(), payload);
 
     match tx.try_send(envelope) {
-        Ok(()) => {}
+        Ok(()) => {
+            record_intent_sent(id);
+            eprint!("\r[DEBUG] [ui_host] intent sent id={id} name=\"{name}\"\r\n");
+        }
         Err(TrySendError::Full(_envelope)) => {
             let dropped = dropped_intent_count.fetch_add(1, Ordering::Relaxed) + 1;
             if dropped == 1 || dropped.is_power_of_two() {

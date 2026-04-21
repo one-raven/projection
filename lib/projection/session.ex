@@ -35,6 +35,7 @@ defmodule Projection.Session do
           max_pending_ops: pos_integer(),
           pending_patch_ops: [map()],
           pending_ack: non_neg_integer() | nil,
+          pending_ack_started_at: integer() | nil,
           patch_flush_ref: {reference(), reference()} | nil,
           tick_ms: pos_integer() | nil,
           tick_ref: reference() | nil,
@@ -126,6 +127,7 @@ defmodule Projection.Session do
         max_pending_ops: normalize_max_pending_ops(Keyword.get(opts, :max_pending_ops, 128)),
         pending_patch_ops: [],
         pending_ack: nil,
+        pending_ack_started_at: nil,
         patch_flush_ref: nil,
         tick_ms: normalize_tick_ms(Keyword.get(opts, :tick_ms)),
         tick_ref: nil,
@@ -306,6 +308,17 @@ defmodule Projection.Session do
         ack = normalize_ack(Map.get(intent, "id"))
         emit_intent_received(state, name, ack)
         Logger.debug("ui intent received name=#{name} ack=#{inspect(ack)}")
+
+        # Stamp the arrival time BEFORE dispatching so `processed_in`
+        # captures mount/dispatch/effects and not just the tail-end
+        # patch enqueue → flush window. If we're already mid-batch,
+        # keep the earlier stamp.
+        state =
+          if is_nil(state.pending_ack_started_at) do
+            %{state | pending_ack_started_at: System.monotonic_time(:microsecond)}
+          else
+            state
+          end
 
         case maybe_handle_route_intent(name, payload, ack, state) do
           {:handled, next_state} ->
@@ -1305,7 +1318,22 @@ defmodule Projection.Session do
   defp enqueue_patch_batch(state, ops, ack) when is_list(ops) do
     pending_ops = coalesce_patch_ops(state.pending_patch_ops ++ ops)
     pending_ack = merge_patch_ack(state.pending_ack, ack)
-    next_state = %{state | pending_patch_ops: pending_ops, pending_ack: pending_ack}
+
+    # Stamp the first intent's arrival time for the current batch so
+    # we can log end-to-end Elixir processing time when the patch flushes.
+    started_at =
+      cond do
+        is_nil(pending_ack) -> nil
+        is_nil(state.pending_ack_started_at) -> System.monotonic_time(:microsecond)
+        true -> state.pending_ack_started_at
+      end
+
+    next_state = %{
+      state
+      | pending_patch_ops: pending_ops,
+        pending_ack: pending_ack,
+        pending_ack_started_at: started_at
+    }
 
     cond do
       pending_ops == [] ->
@@ -1342,7 +1370,22 @@ defmodule Projection.Session do
       |> Map.put(:rev, rev)
 
     put_logger_metadata(next_state)
-    Logger.debug("patch sent rev=#{rev} ops=#{ops_count} ack=#{inspect(state.pending_ack)}")
+
+    processed_in =
+      case state.pending_ack_started_at do
+        nil -> nil
+        started -> System.monotonic_time(:microsecond) - started
+      end
+
+    msg =
+      "patch sent rev=#{rev} ops=#{ops_count} ack=#{inspect(state.pending_ack)} " <>
+        "processed_in=#{if processed_in, do: format_us(processed_in), else: "n/a"}"
+
+    if is_integer(processed_in) and processed_in >= 100_000 do
+      Logger.warning(msg)
+    else
+      Logger.debug(msg)
+    end
 
     Telemetry.execute(
       @event_patch_sent,
@@ -1365,7 +1408,14 @@ defmodule Projection.Session do
 
   defp clear_pending_patch_batch(state) do
     cancel_patch_flush_timer(state.patch_flush_ref)
-    %{state | pending_patch_ops: [], pending_ack: nil, patch_flush_ref: nil}
+
+    %{
+      state
+      | pending_patch_ops: [],
+        pending_ack: nil,
+        pending_ack_started_at: nil,
+        patch_flush_ref: nil
+    }
   end
 
   defp cancel_patch_flush_timer({_token, timer_ref}) when is_reference(timer_ref) do
@@ -1402,6 +1452,11 @@ defmodule Projection.Session do
   defp merge_patch_ack(ack, nil), do: ack
   defp merge_patch_ack(nil, ack), do: ack
   defp merge_patch_ack(left, right), do: max(left, right)
+
+  # Format a microsecond duration — sub-5ms stays in µs for precision,
+  # longer gets rounded to ms.
+  defp format_us(us) when is_integer(us) and us >= 5_000, do: "#{div(us, 1_000)}ms"
+  defp format_us(us) when is_integer(us), do: "#{us}µs"
 
   defp normalize_tick_ms(tick_ms) when is_integer(tick_ms) and tick_ms > 0, do: tick_ms
   defp normalize_tick_ms(_tick_ms), do: nil
