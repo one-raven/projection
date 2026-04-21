@@ -35,6 +35,16 @@ fn take_intent_rtt_us(ack: u64) -> Option<u128> {
     Some(started.elapsed().as_micros())
 }
 
+/// Format a microsecond duration — sub-5ms stays in µs for precision,
+/// longer gets rounded to ms.
+fn fmt_us(us: u128) -> String {
+    if us >= 5_000 {
+        format!("{}ms", us / 1_000)
+    } else {
+        format!("{}µs", us)
+    }
+}
+
 pub use crate::protocol::{
     ELIXIR_TO_UI_CAP, ElixirEnvelope, PatchOp, UI_TO_ELIXIR_CAP, UiEnvelope,
     ready_envelope_with_reason,
@@ -235,8 +245,7 @@ pub fn run<B: HostBindings>() -> Result<(), Box<dyn std::error::Error>> {
                         ack_id,
                         rev,
                         ops.len(),
-                        rtt.map(|us| format!("{us}µs"))
-                            .unwrap_or_else(|| "unknown".to_string()),
+                        rtt.map(fmt_us).unwrap_or_else(|| "unknown".to_string()),
                     );
                 }
 

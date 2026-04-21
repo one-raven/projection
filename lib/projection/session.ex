@@ -1368,7 +1368,7 @@ defmodule Projection.Session do
 
     Logger.debug(
       "patch sent rev=#{rev} ops=#{ops_count} ack=#{inspect(state.pending_ack)} " <>
-        "processed_in=#{if processed_in, do: "#{processed_in}µs", else: "n/a"}"
+        "processed_in=#{if processed_in, do: format_us(processed_in), else: "n/a"}"
     )
 
     Telemetry.execute(
@@ -1436,6 +1436,11 @@ defmodule Projection.Session do
   defp merge_patch_ack(ack, nil), do: ack
   defp merge_patch_ack(nil, ack), do: ack
   defp merge_patch_ack(left, right), do: max(left, right)
+
+  # Format a microsecond duration — sub-5ms stays in µs for precision,
+  # longer gets rounded to ms.
+  defp format_us(us) when is_integer(us) and us >= 5_000, do: "#{div(us, 1_000)}ms"
+  defp format_us(us) when is_integer(us), do: "#{us}µs"
 
   defp normalize_tick_ms(tick_ms) when is_integer(tick_ms) and tick_ms > 0, do: tick_ms
   defp normalize_tick_ms(_tick_ms), do: nil
