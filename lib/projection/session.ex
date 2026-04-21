@@ -35,6 +35,7 @@ defmodule Projection.Session do
           max_pending_ops: pos_integer(),
           pending_patch_ops: [map()],
           pending_ack: non_neg_integer() | nil,
+          pending_ack_started_at: integer() | nil,
           patch_flush_ref: {reference(), reference()} | nil,
           tick_ms: pos_integer() | nil,
           tick_ref: reference() | nil,
@@ -126,6 +127,7 @@ defmodule Projection.Session do
         max_pending_ops: normalize_max_pending_ops(Keyword.get(opts, :max_pending_ops, 128)),
         pending_patch_ops: [],
         pending_ack: nil,
+        pending_ack_started_at: nil,
         patch_flush_ref: nil,
         tick_ms: normalize_tick_ms(Keyword.get(opts, :tick_ms)),
         tick_ref: nil,
@@ -1305,7 +1307,22 @@ defmodule Projection.Session do
   defp enqueue_patch_batch(state, ops, ack) when is_list(ops) do
     pending_ops = coalesce_patch_ops(state.pending_patch_ops ++ ops)
     pending_ack = merge_patch_ack(state.pending_ack, ack)
-    next_state = %{state | pending_patch_ops: pending_ops, pending_ack: pending_ack}
+
+    # Stamp the first intent's arrival time for the current batch so
+    # we can log end-to-end Elixir processing time when the patch flushes.
+    started_at =
+      cond do
+        is_nil(pending_ack) -> nil
+        is_nil(state.pending_ack_started_at) -> System.monotonic_time(:microsecond)
+        true -> state.pending_ack_started_at
+      end
+
+    next_state = %{
+      state
+      | pending_patch_ops: pending_ops,
+        pending_ack: pending_ack,
+        pending_ack_started_at: started_at
+    }
 
     cond do
       pending_ops == [] ->
@@ -1342,7 +1359,17 @@ defmodule Projection.Session do
       |> Map.put(:rev, rev)
 
     put_logger_metadata(next_state)
-    Logger.debug("patch sent rev=#{rev} ops=#{ops_count} ack=#{inspect(state.pending_ack)}")
+
+    processed_in =
+      case state.pending_ack_started_at do
+        nil -> nil
+        started -> System.monotonic_time(:microsecond) - started
+      end
+
+    Logger.debug(
+      "patch sent rev=#{rev} ops=#{ops_count} ack=#{inspect(state.pending_ack)} " <>
+        "processed_in=#{if processed_in, do: "#{processed_in}µs", else: "n/a"}"
+    )
 
     Telemetry.execute(
       @event_patch_sent,
@@ -1365,7 +1392,14 @@ defmodule Projection.Session do
 
   defp clear_pending_patch_batch(state) do
     cancel_patch_flush_timer(state.patch_flush_ref)
-    %{state | pending_patch_ops: [], pending_ack: nil, patch_flush_ref: nil}
+
+    %{
+      state
+      | pending_patch_ops: [],
+        pending_ack: nil,
+        pending_ack_started_at: nil,
+        patch_flush_ref: nil
+    }
   end
 
   defp cancel_patch_flush_timer({_token, timer_ref}) when is_reference(timer_ref) do
