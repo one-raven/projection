@@ -249,8 +249,8 @@ pub fn run<B: HostBindings>() -> Result<(), Box<dyn std::error::Error>> {
                 if let Some(ack_id) = ack {
                     let rtt = take_intent_rtt_us(ack_id);
                     let level = rtt.map(level_for).unwrap_or("[DEBUG]");
-                    eprintln!(
-                        "\r{} [ui_host] patch received ack={} rev={} ops={} rtt={}",
+                    eprint!(
+                        "\r{} [ui_host] patch received ack={} rev={} ops={} rtt={}\r\n",
                         level,
                         ack_id,
                         rev,
@@ -489,7 +489,7 @@ fn send_intent(
     match tx.try_send(envelope) {
         Ok(()) => {
             record_intent_sent(id);
-            eprintln!("\r[DEBUG] [ui_host] intent sent id={id} name=\"{name}\"");
+            eprint!("\r[DEBUG] [ui_host] intent sent id={id} name=\"{name}\"\r\n");
         }
         Err(TrySendError::Full(_envelope)) => {
             let dropped = dropped_intent_count.fetch_add(1, Ordering::Relaxed) + 1;
