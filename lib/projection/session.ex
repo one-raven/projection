@@ -1366,10 +1366,15 @@ defmodule Projection.Session do
         started -> System.monotonic_time(:microsecond) - started
       end
 
-    Logger.debug(
+    msg =
       "patch sent rev=#{rev} ops=#{ops_count} ack=#{inspect(state.pending_ack)} " <>
         "processed_in=#{if processed_in, do: format_us(processed_in), else: "n/a"}"
-    )
+
+    if is_integer(processed_in) and processed_in >= 100_000 do
+      Logger.warning(msg)
+    else
+      Logger.debug(msg)
+    end
 
     Telemetry.execute(
       @event_patch_sent,

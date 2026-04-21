@@ -45,6 +45,14 @@ fn fmt_us(us: u128) -> String {
     }
 }
 
+/// Any user-visible UI round trip taking ≥100ms is almost always a
+/// regression; tag the log line so it stands out.
+const SLOW_US: u128 = 100_000;
+
+fn level_for(us: u128) -> &'static str {
+    if us >= SLOW_US { "[WARN]" } else { "[DEBUG]" }
+}
+
 pub use crate::protocol::{
     ELIXIR_TO_UI_CAP, ElixirEnvelope, PatchOp, UI_TO_ELIXIR_CAP, UiEnvelope,
     ready_envelope_with_reason,
@@ -240,8 +248,10 @@ pub fn run<B: HostBindings>() -> Result<(), Box<dyn std::error::Error>> {
             ElixirEnvelope::Patch { sid, rev, ack, ops } => {
                 if let Some(ack_id) = ack {
                     let rtt = take_intent_rtt_us(ack_id);
+                    let level = rtt.map(level_for).unwrap_or("[DEBUG]");
                     eprintln!(
-                        "[ui_host] patch received ack={} rev={} ops={} rtt={}",
+                        "\r{} [ui_host] patch received ack={} rev={} ops={} rtt={}",
+                        level,
                         ack_id,
                         rev,
                         ops.len(),
@@ -479,7 +489,7 @@ fn send_intent(
     match tx.try_send(envelope) {
         Ok(()) => {
             record_intent_sent(id);
-            eprintln!("[ui_host] intent sent id={id} name=\"{name}\"");
+            eprintln!("\r[DEBUG] [ui_host] intent sent id={id} name=\"{name}\"");
         }
         Err(TrySendError::Full(_envelope)) => {
             let dropped = dropped_intent_count.fetch_add(1, Ordering::Relaxed) + 1;
