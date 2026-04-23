@@ -3360,6 +3360,7 @@ version = "0.1.0"
 name = "projection_ui_host_runtime"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "projection_ui_host_macros",
  "serde",
  "serde_json",
