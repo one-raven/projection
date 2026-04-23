@@ -57,6 +57,33 @@ pub use crate::protocol::{
     ELIXIR_TO_UI_CAP, ElixirEnvelope, PatchOp, UI_TO_ELIXIR_CAP, UiEnvelope,
     ready_envelope_with_reason,
 };
+
+/// Raise RLIMIT_NOFILE on macOS so Slint's live-preview watcher (kqueue,
+/// one FD per file) doesn't exhaust the default 256 soft limit. No-op on
+/// other platforms and when already at the hard limit.
+#[cfg(target_os = "macos")]
+pub fn raise_fd_limit() {
+    unsafe {
+        let mut lim: libc::rlimit = std::mem::zeroed();
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) != 0 {
+            return;
+        }
+        const TARGET: libc::rlim_t = 65536;
+        let cap = if lim.rlim_max == libc::RLIM_INFINITY {
+            TARGET
+        } else {
+            lim.rlim_max.min(TARGET)
+        };
+        if lim.rlim_cur >= cap {
+            return;
+        }
+        lim.rlim_cur = cap;
+        let _ = libc::setrlimit(libc::RLIMIT_NOFILE, &lim);
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn raise_fd_limit() {}
 pub use serde_json;
 
 const DEFAULT_UI_OUTBOUND_QUEUE_CAP: usize = 256;
@@ -1004,6 +1031,7 @@ macro_rules! app_main {
         }
 
         fn main() {
+            $crate::raise_fd_limit();
             if let Err(err) = $crate::run::<ProjectionRuntimeBindings>() {
                 eprintln!("ui_host fatal error: {err}");
                 std::process::exit(1);
