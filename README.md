@@ -708,6 +708,33 @@ mix compile
 mix test
 ```
 
+## Development: live-preview
+
+When `MIX_ENV=dev`, `mix compile` automatically builds the Slint host with
+`slint/live-preview` enabled. The host watches its `.slint` files on disk and
+reloads them in-process when you save — no `cargo` rebuild and no Elixir
+restart. Properties, models, and callbacks are preserved across reloads, so an
+active session keeps running.
+
+What each edit triggers:
+
+| Edit | Action needed |
+|---|---|
+| `.slint` under `lib/<your_app>/ui/` (colors, layout, bindings) | save — reload is automatic |
+| ProjectionUI Elixir module (fields, screens) | `mix projection.codegen` — reload on file write |
+| Rust hook or runtime | `mix compile` (rebuild) |
+
+Escape hatches:
+
+- `PROJECTION_LIVE_PREVIEW=0 mix compile` — opt out of live-preview locally.
+  Useful for reproducing prod-path behavior and for CI runs that stay in
+  `MIX_ENV=dev`.
+- `MIX_ENV=test` and `MIX_ENV=prod` never enable live-preview. Combining
+  `PROJECTION_LIVE_PREVIEW=1` with `MIX_ENV=prod` is a hard error.
+
+Live-preview artifacts live under `slint/ui_host/target/live-preview/` so they
+do not clobber plain debug or release builds.
+
 ## Observability
 
 Runtime logs include structured metadata:

@@ -2,7 +2,19 @@ defmodule Mix.Tasks.Compile.ProjectionUiHost do
   @moduledoc """
   Compiler task that builds the Slint UI host binary and copies it to `priv/ui_host/`.
 
-  Uses `--release` in `:prod` Mix env, debug profile otherwise.
+  Build mode selection:
+
+    * `:release` — `MIX_ENV=prod`. Adds `--release`.
+    * `:live_preview` — `MIX_ENV=dev` unless `PROJECTION_LIVE_PREVIEW=0`. Adds
+      `--features live-preview`, sets `SLINT_LIVE_PREVIEW=1` for the cargo
+      invocation, and builds into an isolated `target/live-preview/` dir so it
+      does not clobber plain debug artifacts. Enables Slint's in-process
+      `.slint` file watcher — UI edits reload without re-running cargo.
+    * `:debug` — everything else (`:test`, or `:dev` with opt-out).
+
+  Setting `PROJECTION_LIVE_PREVIEW=1` with `MIX_ENV=prod` is a hard error so
+  the dev-only feature cannot leak into release builds.
+
   Streams cargo output in real time with color support.
   """
 
@@ -66,19 +78,56 @@ defmodule Mix.Tasks.Compile.ProjectionUiHost do
   end
 
   defp build_ui_host(manifest) do
-    build_args =
-      ["build", "--color=always", "--manifest-path", manifest] ++
-        if(Mix.env() == :prod, do: ["--release"], else: [])
+    port_opts =
+      [:binary, :exit_status, :stderr_to_stdout, args: build_args(manifest)] ++
+        build_env()
 
-    port =
-      Port.open({:spawn_executable, cargo_path()}, [
-        :binary,
-        :exit_status,
-        :stderr_to_stdout,
-        args: build_args
-      ])
+    port = Port.open({:spawn_executable, cargo_path()}, port_opts)
 
     stream_port_output(port)
+  end
+
+  defp build_args(manifest) do
+    base = ["build", "--color=always", "--manifest-path", manifest]
+
+    case build_mode() do
+      :release ->
+        base ++ ["--release"]
+
+      :live_preview ->
+        base ++
+          ["--features", "slint/live-preview", "--target-dir", live_preview_target_dir()]
+
+      :debug ->
+        base
+    end
+  end
+
+  defp build_env do
+    case build_mode() do
+      :live_preview -> [env: [{~c"SLINT_LIVE_PREVIEW", ~c"1"}]]
+      _ -> []
+    end
+  end
+
+  @doc false
+  def build_mode do
+    case {Mix.env(), System.get_env("PROJECTION_LIVE_PREVIEW")} do
+      {:prod, "1"} ->
+        Mix.raise("PROJECTION_LIVE_PREVIEW=1 cannot be combined with MIX_ENV=prod")
+
+      {:prod, _} ->
+        :release
+
+      {:dev, "0"} ->
+        :debug
+
+      {:dev, _} ->
+        :live_preview
+
+      _ ->
+        :debug
+    end
   end
 
   defp stream_port_output(port) do
@@ -101,12 +150,27 @@ defmodule Mix.Tasks.Compile.ProjectionUiHost do
   end
 
   defp needs_rebuild?(destination) do
-    case {File.stat(destination), File.stat(manifest_path())} do
-      {{:ok, _dest}, {:ok, manifest_stat}} ->
+    current = Atom.to_string(build_mode())
+
+    case {File.stat(destination), File.stat(manifest_path()), read_manifest_mode()} do
+      {{:ok, _dest}, {:ok, manifest_stat}, ^current} ->
         latest_source_mtime() > manifest_stat.mtime
 
       _ ->
         true
+    end
+  end
+
+  defp read_manifest_mode do
+    case File.read(manifest_path()) do
+      {:ok, content} ->
+        case String.split(content, "\n", parts: 2) do
+          [_ts, mode] -> String.trim(mode)
+          _ -> nil
+        end
+
+      _ ->
+        nil
     end
   end
 
@@ -142,8 +206,23 @@ defmodule Mix.Tasks.Compile.ProjectionUiHost do
 
   defp source_binary_path do
     suffix = if match?({:win32, _}, :os.type()), do: ".exe", else: ""
-    profile = if Mix.env() == :prod, do: "release", else: "debug"
-    Path.expand(Path.join(["slint", "ui_host", "target", profile, "ui_host" <> suffix]))
+
+    {target_dir, profile} =
+      case build_mode() do
+        :release -> {default_target_dir(), "release"}
+        :debug -> {default_target_dir(), "debug"}
+        :live_preview -> {live_preview_target_dir(), "debug"}
+      end
+
+    Path.join([target_dir, profile, "ui_host" <> suffix])
+  end
+
+  defp default_target_dir do
+    Path.expand(Path.join(["slint", "ui_host", "target"]))
+  end
+
+  defp live_preview_target_dir do
+    Path.expand(Path.join(["slint", "ui_host", "target", "live-preview"]))
   end
 
   defp destination_path do
@@ -158,7 +237,7 @@ defmodule Mix.Tasks.Compile.ProjectionUiHost do
   defp write_manifest do
     path = manifest_path()
     File.mkdir_p!(Path.dirname(path))
-    File.write!(path, "#{System.system_time(:second)}")
+    File.write!(path, "#{System.system_time(:second)}\n#{build_mode()}")
   end
 
   defp diagnostic(message, file) do
