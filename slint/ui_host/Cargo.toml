@@ -11,11 +11,11 @@ kms = ["slint/backend-linuxkms-noseat"]
 [dependencies]
 projection_ui_host_runtime = { path = "../ui_host_runtime" }
 serde_json = "1.0.149"
-slint = { version = "=1.16.0", default-features = false, features = ["std", "renderer-software", "compat-1-2"] }
+slint = { version = "=1.16.1", default-features = false, features = ["std", "renderer-software", "compat-1-2"] }
 
 [build-dependencies]
 projection_ui_host_codegen = { path = "../ui_host_codegen" }
-slint-build = "=1.16.0"
+slint-build = "=1.16.1"
 
 [profile.release]
 strip = true
