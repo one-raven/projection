@@ -2384,10 +2384,13 @@ defmodule Mix.Tasks.Projection.Codegen do
       |> Enum.sort()
       |> Enum.join("\n")
 
-    # AppShell owns navigation chrome. Wire active_tab and navigate through the shell.
+    # AppShell owns the legacy `active_tab` chrome prop. The legacy
+    # `navigate` callback is still declared on `AppWindow` so the
+    # ui-host runtime's `bind_navigate` hook compiles, but no slint
+    # code in-tree fires it anymore — every navigation flows through
+    # `UI.intent` and the `ProjectionBridge`.
     shell_nav_props = """
             active_tab: root.active_screen;
-            navigate(route) => { root.navigate(route, "{}"); }
     """
 
     """
